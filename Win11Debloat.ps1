@@ -524,7 +524,7 @@ function Strip-Progress {
 }
 
 # =================================================================================================
-# NEW AND IMPROVED RegImport FUNCTION - Replaces the original one
+# NEW AND IMPROVED RegImport FUNCTION (v2) - Fixes "File in Use" Error for Logged-In User
 # This function intelligently applies registry files to all existing and future users.
 # =================================================================================================
 function RegImport {
@@ -541,13 +541,13 @@ function RegImport {
         return
     }
 
-    # Get the content of the .reg file to determine its type (HKCU or HKLM)
     $RegContent = Get-Content -Path $FullRegPath -Raw -ErrorAction SilentlyContinue
+    $TempRegFile = "$env:TEMP\temp_reg_import.reg"
 
     # --- Apply HKLM (System-Wide) Settings ---
     if ($RegContent -match '\[HKEY_LOCAL_MACHINE\\') {
         Write-Verbose "Applying HKLM settings from '$RegFilePath'..."
-        reg import $FullRegPath
+        reg import $FullRegPath | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "An error occurred while importing HKLM settings from '$RegFilePath'."
         } else {
@@ -565,26 +565,22 @@ function RegImport {
             try {
                 Write-Verbose "  - Loading Default User profile hive..."
                 reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
-                
-                # Create a temporary .reg file with the hive path replaced
                 $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\DefaultUserHive'
-                $TempRegFile = "$env:TEMP\temp.reg"
                 Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
-                
                 reg import $TempRegFile | Out-Null
                 Write-Host "  Applied settings to Default User Profile (for new users)." -ForegroundColor DarkGray
-            }
-            catch {
+            } catch {
                 Write-Warning "  Could not apply settings to Default User Profile. Error: $($_.Exception.Message)"
-            }
-            finally {
-                Write-Verbose "  - Unloading Default User profile hive..."
-                Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
+            } finally {
                 reg unload "HKU\DefaultUserHive" | Out-Null
             }
         } else {
             Write-Warning "  Default User profile hive not found at '$DefaultUserPath'."
         }
+
+        # PERFORMANCE OPTIMIZATION: Get all user SIDs once.
+        $UserSIDs = @{}
+        try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.Name] = $_.SID } } catch {}
 
         # 2. Modify all existing user profiles
         Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
@@ -596,45 +592,39 @@ function RegImport {
                 return
             }
             
-            # Check if hive is already loaded (user is logged on)
-            $LoadedHive = Test-Path "HKU\$((Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value)"
-            if ($LoadedHive) {
-                # User is logged on, we can apply HKCU directly if it's the current user, or modify their loaded hive
+            $UserSID = $UserSIDs[$UserProfile.Name]
+            if (-not $UserSID) { return } # Skip if user has no SID
+
+            # ---- CORE LOGIC FIX ----
+            # Check if the user's hive is already loaded (meaning they are logged in)
+            if (Test-Path "Registry::HKEY_USERS\$UserSID") {
+                # THE FIX: User is logged in, so we modify their already loaded hive directly.
                 Write-Host "  Applying settings to logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
                 try {
-                    $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', "[HKEY_USERS\$((Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value)"
-                    $TempRegFile = "$env:TEMP\temp.reg"
+                    $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', "[HKEY_USERS\$UserSID"
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
                 } catch {
                     Write-Warning "  Could not apply settings to logged-in user $($UserProfile.Name). Error: $($_.Exception.Message)"
-                } finally {
-                    Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
                 }
             } else {
-                # User is not logged on, load their hive temporarily
-                Write-Host "  Applying settings to user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
+                # User is NOT logged in, so we can safely load their hive temporarily.
+                Write-Host "  Applying settings to logged-off user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
                 try {
                     reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
-                    
-                    # Create a temporary .reg file with the hive path replaced
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\TempUserHive'
-                    $TempRegFile = "$env:TEMP\temp.reg"
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
-                    
                     reg import $TempRegFile | Out-Null
-                }
-                catch {
-                    # This often happens if the file is locked by another process
-                    Write-Warning "  Could not apply settings to user profile $($UserProfile.Name). The profile may be in use or inaccessible. Error: $($_.Exception.Message)"
-                }
-                finally {
-                    Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
+                } catch {
+                    Write-Warning "  Could not load or apply settings to user profile $($UserProfile.Name). Error: $($_.Exception.Message)"
+                } finally {
                     # CRITICAL: Always unload the hive, even if an error occurred
                     reg unload "HKU\TempUserHive" | Out-Null
                 }
             }
         }
+        # Clean up the temporary reg file
+        Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
     }
     Write-Output ""
 }
