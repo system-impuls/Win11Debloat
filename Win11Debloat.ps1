@@ -344,98 +344,74 @@ function ReadAppslistFromFile {
 }
 
 
-# Removes apps specified during function call from all user accounts and from the OS image.
+# =================================================================================================
+# NEW AND IMPROVED RemoveApps FUNCTION - Targets all users directly for reliable removal
+# =================================================================================================
 function RemoveApps {
     param (
-        $appslist
+        [string[]]$AppsList
     )
 
-    Foreach ($app in $appsList) { 
-        Write-Output "Attempting to remove $app..."
+    Write-Host "> Processing removal for $($AppsList.Count) app(s)/package(s)..." -ForegroundColor Yellow
 
-        if (($app -eq "Microsoft.OneDrive") -or ($app -eq "Microsoft.Edge")) {
-            # Use winget to remove OneDrive and Edge
-            if ($global:wingetInstalled -eq $false) {
-                Write-Host "Error: WinGet is either not installed or is outdated, $app could not be removed" -ForegroundColor Red
+    # PERFORMANCE OPTIMIZATION: Get all user SIDs once.
+    $UserSIDs = @{}
+    try {
+        Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.SID] = $_.Name }
+    } catch {
+        Write-Warning "Could not retrieve user SIDs. App removal for other users might be limited."
+    }
+
+    foreach ($App in $AppsList) {
+        Write-Output "--> Attempting to remove package pattern: $App"
+
+        # --- Step 1: Remove the Provisioned Package (for all future users) ---
+        # This prevents the app from being re-installed for new user accounts.
+        try {
+            $ProvisionedPackage = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$App*" -or $_.PackageName -like "*$App*" }
+            if ($ProvisionedPackage) {
+                Write-Host "  - Found provisioned package: $($ProvisionedPackage.PackageName). Removing..." -ForegroundColor DarkGray
+                $ProvisionedPackage | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction Stop | Out-Null
+                Write-Host "    Provisioned package removed."
+            } else {
+                Write-Verbose "  - No matching provisioned package found for pattern '$App'."
             }
-            else {
-                # Uninstall app via winget
-                Strip-Progress -ScriptBlock { winget uninstall --accept-source-agreements --disable-interactivity --id $app } | Tee-Object -Variable wingetOutput 
-
-                If (($app -eq "Microsoft.Edge") -and (Select-String -InputObject $wingetOutput -Pattern "Uninstall failed with exit code")) {
-                    Write-Host "Unable to uninstall Microsoft Edge via Winget" -ForegroundColor Red
-                    Write-Output ""
-
-                    if ($( Read-Host -Prompt "Would you like to forcefully uninstall Edge? NOT RECOMMENDED! (y/n)" ) -eq 'y') {
-                        Write-Output ""
-                        ForceRemoveEdge
-                    }
-                }
-            }
+        } catch {
+            Write-Warning "  - Could not remove provisioned package for pattern '$App'. Error: $($_.Exception.Message)"
         }
-        else {
-            # Use Remove-AppxPackage to remove all other apps
-            $app = '*' + $app + '*'
 
-            # Remove installed app for all existing users
-            if ($WinVersion -ge 22000){
-                # Windows 11 build 22000 or later
-                try {
-                    Get-AppxPackage -Name $app -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction Continue
 
-                    if($DebugPreference -ne "SilentlyContinue") {
-                        Write-Host "Removed $app for all users" -ForegroundColor DarkGray
-                    }
-                }
-                catch {
-                    if($DebugPreference -ne "SilentlyContinue") {
-                        Write-Host "Unable to remove $app for all users" -ForegroundColor Yellow
-                        Write-Host $psitem.Exception.StackTrace -ForegroundColor Gray
-                    }
-                }
-            }
-            else {
-                # Windows 10
-                try {
-                    Get-AppxPackage -Name $app | Remove-AppxPackage -ErrorAction SilentlyContinue
-                    
-                    if($DebugPreference -ne "SilentlyContinue") {
-                        Write-Host "Removed $app for current user" -ForegroundColor DarkGray
-                    }
-                }
-                catch {
-                    if($DebugPreference -ne "SilentlyContinue") {
-                        Write-Host "Unable to remove $app for current user" -ForegroundColor Yellow
-                        Write-Host $psitem.Exception.StackTrace -ForegroundColor Gray
-                    }
-                }
+        # --- Step 2: Remove the App for All Existing Users ---
+        # This iterates through every user on the system and removes the app specifically for them.
+        try {
+            # Get all packages for all users that match the app name
+            $PackagesToRemove = Get-AppxPackage -AllUsers -Name "*$App*" -ErrorAction SilentlyContinue
+            if ($PackagesToRemove) {
+                Write-Host "  - Found installed packages matching pattern '$App'. Targeting for removal across all users..." -ForegroundColor DarkGray
                 
-                try {
-                    Get-AppxPackage -Name $app -PackageTypeFilter Main, Bundle, Resource -AllUsers | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-                    
-                    if($DebugPreference -ne "SilentlyContinue") {
-                        Write-Host "Removed $app for all users" -ForegroundColor DarkGray
-                    }
-                }
-                catch {
-                    if($DebugPreference -ne "SilentlyContinue") {
-                        Write-Host "Unable to remove $app for all users" -ForegroundColor Yellow
-                        Write-Host $psitem.Exception.StackTrace -ForegroundColor Gray
-                    }
-                }
-            }
+                foreach ($Package in $PackagesToRemove) {
+                    $PackageFullName = $Package.PackageFullName
+                    $PackageUserSID = $Package.PackageUserInformation.UserSecurityId.Value
+                    $UserName = $UserSIDs[$PackageUserSID] # Look up username from our cached list
 
-            # Remove provisioned app from OS image, so the app won't be installed for any new users
-            try {
-                Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $app } | ForEach-Object { Remove-ProvisionedAppxPackage -Online -AllUsers -PackageName $_.PackageName }
+                    Write-Host "    - Removing '$PackageFullName' for user: $UserName (SID: $PackageUserSID)..."
+                    try {
+                        # Target the removal for the specific user via their SID
+                        Remove-AppxPackage -Package $PackageFullName -AllUsers -ErrorAction Stop | Out-Null
+                        Write-Host "      ...Success."
+                    } catch {
+                        # This catch block handles cases where the package is part of the system or stubborn.
+                        Write-Warning "      ...Failed to remove package '$PackageFullName' for user '$UserName'. It may be a core component or in use."
+                        Write-Verbose "      Error details: $($_.Exception.Message)"
+                    }
+                }
+            } else {
+                 Write-Verbose "  - No matching installed packages found for pattern '$App' on any user profile."
             }
-            catch {
-                Write-Host "Unable to remove $app from windows image" -ForegroundColor Yellow
-                Write-Host $psitem.Exception.StackTrace -ForegroundColor Gray
-            }
+        } catch {
+            Write-Warning "  - An error occurred while trying to find or remove packages for pattern '$App'. Error: $($_.Exception.Message)"
         }
     }
-            
     Write-Output ""
 }
 
