@@ -3,7 +3,6 @@
 [CmdletBinding(SupportsShouldProcess)]
 param (
     [switch]$Silent,
-    [switch]$Sysprep,
     [switch]$RunAppConfigurator,
     [switch]$RunDefaults, [switch]$RunWin11Defaults,
     [switch]$RunSavedSettings,
@@ -524,31 +523,121 @@ function Strip-Progress {
     }
 }
 
-
-# Import & execute regfile
+# =================================================================================================
+# NEW AND IMPROVED RegImport FUNCTION - Replaces the original one
+# This function intelligently applies registry files to all existing and future users.
+# =================================================================================================
 function RegImport {
     param (
-        $message,
-        $path
+        [string]$Message,
+        [string]$RegFilePath
     )
 
-    Write-Output $message
+    Write-Output $Message
 
-
-    if (!$global:Params.ContainsKey("Sysprep")) {
-        reg import "$PSScriptRoot\Regfiles\$path"  
-    }
-    else {
-        $defaultUserPath = $env:USERPROFILE -Replace ('\\' + $env:USERNAME + '$'), '\Default\NTUSER.DAT'
-        
-        reg load "HKU\Default" $defaultUserPath | Out-Null
-        reg import "$PSScriptRoot\Regfiles\Sysprep\$path"  
-        reg unload "HKU\Default" | Out-Null
+    $FullRegPath = "$PSScriptRoot\Regfiles\$RegFilePath"
+    if (-not (Test-Path $FullRegPath)) {
+        Write-Warning "Registry file not found at '$FullRegPath'. Skipping."
+        return
     }
 
+    # Get the content of the .reg file to determine its type (HKCU or HKLM)
+    $RegContent = Get-Content -Path $FullRegPath -Raw -ErrorAction SilentlyContinue
+
+    # --- Apply HKLM (System-Wide) Settings ---
+    if ($RegContent -match '\[HKEY_LOCAL_MACHINE\\') {
+        Write-Verbose "Applying HKLM settings from '$RegFilePath'..."
+        reg import $FullRegPath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "An error occurred while importing HKLM settings from '$RegFilePath'."
+        } else {
+            Write-Host "  Successfully applied system-wide (HKLM) settings." -ForegroundColor DarkGray
+        }
+    }
+
+    # --- Apply HKCU (User-Specific) Settings to All Users and Default Profile ---
+    if ($RegContent -match '\[HKEY_CURRENT_USER\\') {
+        Write-Verbose "Applying HKCU settings from '$RegFilePath' to all users..."
+
+        # 1. Modify the Default User profile (for all future users)
+        $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+        if (Test-Path $DefaultUserPath) {
+            try {
+                Write-Verbose "  - Loading Default User profile hive..."
+                reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
+                
+                # Create a temporary .reg file with the hive path replaced
+                $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\DefaultUserHive'
+                $TempRegFile = "$env:TEMP\temp.reg"
+                Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
+                
+                reg import $TempRegFile | Out-Null
+                Write-Host "  Applied settings to Default User Profile (for new users)." -ForegroundColor DarkGray
+            }
+            catch {
+                Write-Warning "  Could not apply settings to Default User Profile. Error: $($_.Exception.Message)"
+            }
+            finally {
+                Write-Verbose "  - Unloading Default User profile hive..."
+                Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
+                reg unload "HKU\DefaultUserHive" | Out-Null
+            }
+        } else {
+            Write-Warning "  Default User profile hive not found at '$DefaultUserPath'."
+        }
+
+        # 2. Modify all existing user profiles
+        Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+            $UserProfile = $_
+            $NTUserDataFile = Join-Path -Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
+
+            # Skip special profiles
+            if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) {
+                return
+            }
+            
+            # Check if hive is already loaded (user is logged on)
+            $LoadedHive = Test-Path "HKU\$((Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value)"
+            if ($LoadedHive) {
+                # User is logged on, we can apply HKCU directly if it's the current user, or modify their loaded hive
+                Write-Host "  Applying settings to logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
+                try {
+                    $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', "[HKEY_USERS\$((Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value)"
+                    $TempRegFile = "$env:TEMP\temp.reg"
+                    Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
+                    reg import $TempRegFile | Out-Null
+                } catch {
+                    Write-Warning "  Could not apply settings to logged-in user $($UserProfile.Name). Error: $($_.Exception.Message)"
+                } finally {
+                    Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
+                }
+            } else {
+                # User is not logged on, load their hive temporarily
+                Write-Host "  Applying settings to user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
+                try {
+                    reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
+                    
+                    # Create a temporary .reg file with the hive path replaced
+                    $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\TempUserHive'
+                    $TempRegFile = "$env:TEMP\temp.reg"
+                    Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
+                    
+                    reg import $TempRegFile | Out-Null
+                }
+                catch {
+                    # This often happens if the file is locked by another process
+                    Write-Warning "  Could not apply settings to user profile $($UserProfile.Name). The profile may be in use or inaccessible. Error: $($_.Exception.Message)"
+                }
+                finally {
+                    Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
+                    # CRITICAL: Always unload the hive, even if an error occurred
+                    reg unload "HKU\TempUserHive" | Out-Null
+                }
+            }
+        }
+    }
     Write-Output ""
 }
-
 
 # Restart the Windows Explorer process
 function RestartExplorer {
@@ -675,13 +764,9 @@ function PrintHeader {
     )
 
     $fullTitle = " Win11Debloat Script - $title"
-
-    if ($global:Params.ContainsKey("Sysprep")) {
-        $fullTitle = "$fullTitle (Sysprep mode)"
-    }
-    else {
-        $fullTitle = "$fullTitle (User: $Env:UserName)"
-    }
+    $fullTitle = "$fullTitle (User: $Env:UserName)"
+	
+   
 
     Clear-Host
     Write-Output "-------------------------------------------------------------------------------------------"
@@ -974,7 +1059,7 @@ $WinVersion = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\Current
 
 $global:Params = $PSBoundParameters
 $global:FirstSelection = $true
-$SPParams = 'WhatIf', 'Confirm', 'Verbose', 'Silent', 'Sysprep', 'Debug'
+$SPParams = 'WhatIf', 'Confirm', 'Verbose', 'Silent', 'Debug'
 $SPParamCount = 0
 
 # Count how many SPParams exist within Params
@@ -994,21 +1079,12 @@ else {
     $ProgressPreference = 'Continue'
 }
 
-if ($global:Params.ContainsKey("Sysprep")) {
-    $defaultUserPath = $env:USERPROFILE -Replace ('\\' + $env:USERNAME + '$'), '\Default\NTUSER.DAT'
-
-    # Exit script if default user directory or NTUSER.DAT file cannot be found
-    if (-not (Test-Path "$defaultUserPath")) {
-        Write-Host "Error: Unable to start Win11Debloat in Sysprep mode, cannot find default user folder at '$defaultUserPath'" -ForegroundColor Red
-        AwaitKeyToExit
-        Exit
-    }
-    # Exit script if run in Sysprep mode on Windows 10
-    if ($WinVersion -lt 22000) {
-        Write-Host "Error: Win11Debloat Sysprep mode is not supported on Windows 10" -ForegroundColor Red
-        AwaitKeyToExit
-        Exit
-    }
+# Since the script now always modifies the Default User profile, these checks are always relevant.
+$defaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+if (-not (Test-Path "$defaultUserPath")) {
+    Write-Host "Error: Cannot find default user profile at '$defaultUserPath'. Settings for new users cannot be applied." -ForegroundColor Red
+    AwaitKeyToExit
+    Exit
 }
 
 # Remove SavedSettings file if it exists and is empty
@@ -1185,32 +1261,10 @@ if ((-not $global:Params.Count) -or $RunDefaults -or $RunWin11Defaults -or $RunS
             # Only show this option for Windows 11 users running build 22621 or later
             if ($WinVersion -ge 22621){
                 Write-Output ""
-
-                if ($global:Params.ContainsKey("Sysprep")) {
-                    if ($( Read-Host -Prompt "Remove all pinned apps from the start menu for all existing and new users? (y/n)" ) -eq 'y') {
-                        AddParameter 'ClearStartAllUsers' 'Remove all pinned apps from the start menu for existing and new users'
-                    }
-                }
-                else {
-                    Do {
-                        Write-Host "Options:" -ForegroundColor Yellow
-                        Write-Host " (n) Don't remove any pinned apps from the start menu" -ForegroundColor Yellow
-                        Write-Host " (1) Remove all pinned apps from the start menu for this user only ($env:USERNAME)" -ForegroundColor Yellow
-                        Write-Host " (2) Remove all pinned apps from the start menu for all existing and new users"  -ForegroundColor Yellow
-                        $ClearStartInput = Read-Host "Remove all pinned apps from the start menu? (n/1/2)" 
-                    }
-                    while ($ClearStartInput -ne 'n' -and $ClearStartInput -ne '0' -and $ClearStartInput -ne '1' -and $ClearStartInput -ne '2') 
-    
-                    # Select correct option based on user input
-                    switch ($ClearStartInput) {
-                        '1' {
-                            AddParameter 'ClearStart' "Remove all pinned apps from the start menu for this user only"
-                        }
-                        '2' {
-                            AddParameter 'ClearStartAllUsers' "Remove all pinned apps from the start menu for all existing and new users"
-                        }
-                    }
-                }
+		# Since the script now always applies settings for all users, we only need one simple question.
+		if ($( Read-Host -Prompt "Remove all pinned apps from the start menu for all existing and new users? (y/n)" ) -eq 'y') {
+   		AddParameter 'ClearStartAllUsers' 'Remove all pinned apps from the start menu for existing and new users'
+		}
             }
 
             Write-Output ""
