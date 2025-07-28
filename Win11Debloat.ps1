@@ -983,10 +983,105 @@ function Disable-EdgeStandardAutostart {
 #                                                                                                                #
 ##################################################################################################################
 
-$choice = Read-Host "Disable BitLocker on C:? (Enter 0 for YES, 1 for NO)"
-if ($choice -eq '0') {
-    manage-bde C: -off
+# =================================================================================================
+# NEW AND IMPROVED BITLOCKER CONFIGURATION SECTION (v2 - with y/n prompts)
+# This section checks the current status and allows enabling, disabling, or skipping.
+# =================================================================================================
+
+# Check for Administrator Privileges, as BitLocker management requires it.
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Warning "Administrator privileges are required to manage BitLocker. Skipping this section."
+} else {
+    Write-Host "`n--- BitLocker Configuration for Drive C: ---" -ForegroundColor Yellow
+    
+    try {
+        # Get the BitLocker volume information for the C: drive
+        $BitLockerVolume = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
+        $ProtectionStatus = $BitLockerVolume.ProtectionStatus
+        $EncryptionPercentage = $BitLockerVolume.EncryptionPercentage
+        $VolumeType = $BitLockerVolume.VolumeType
+        
+        # --- Scenario 1: BitLocker is ON ---
+        if ($ProtectionStatus -eq 'On') {
+            Write-Host "Status: BitLocker protection is currently ON for drive C:." -ForegroundColor Green
+            $choice = Read-Host "Do you want to disable it? (y/n)"
+            if ($choice -eq 'y') {
+                Write-Host "Disabling BitLocker on C:. This can take a long time as the drive decrypts..."
+                # This is an asynchronous operation. The command finishes instantly, but decryption runs in the background.
+                Disable-BitLocker -MountPoint "C:"
+                Write-Host "Decryption has been initiated. You can check the progress in the BitLocker control panel."
+            } else {
+                Write-Host "Keeping BitLocker enabled."
+            }
+        
+        # --- Scenario 2: BitLocker is OFF ---
+        } elseif ($ProtectionStatus -eq 'Off') {
+            # Check if drive is already encrypted but protection is just suspended (less common for C:)
+            if ($EncryptionPercentage -gt 0) {
+                 Write-Host "Status: BitLocker protection is OFF, but the drive is partially/fully encrypted." -ForegroundColor Cyan
+                 $choice = Read-Host "Do you want to re-enable protection? (y/n)"
+                 if ($choice -eq 'y') {
+                    Write-Host "Resuming BitLocker protection on C:..."
+                    Resume-BitLocker -MountPoint "C:"
+                 } else {
+                    Write-Host "Keeping BitLocker protection off."
+                 }
+            # Drive is fully decrypted
+            } else {
+                Write-Host "Status: BitLocker is currently OFF and the drive is not encrypted." -ForegroundColor Cyan
+                # Check if the drive is an Operating System drive, as this is required for standard BitLocker.
+                if ($VolumeType -ne 'OperatingSystem') {
+                    Write-Warning "Drive C: is not identified as an 'OperatingSystem' volume type. BitLocker cannot be enabled via this script."
+                } else {
+                    $choice = Read-Host "Do you want to enable it? (y/n)"
+                    if ($choice -eq 'y') {
+                        Write-Warning "ENABLING BITLOCKER:"
+                        Write-Warning "1. A recovery key will be saved to a file on your Desktop."
+                        Write-Warning "2. You MUST save this key in a safe place, separate from your computer."
+                        Write-Warning "3. If you lose this key, you could permanently lose access to all your data."
+                        $confirmEnable = Read-Host "Are you sure you want to proceed? This is your final confirmation. (y/n)"
+                        if ($confirmEnable -eq 'y') {
+                            try {
+                                Write-Host "Enabling BitLocker on C:. Please follow any on-screen prompts..."
+                                # Save the recovery key to the current user's desktop
+                                $RecoveryKeyPath = "$env:USERPROFILE\Desktop"
+                                # Enable BitLocker with a recovery password. This is the most compatible method.
+                                Enable-BitLocker -MountPoint "C:" -RecoveryPasswordProtector -SkipHardwareTest -ErrorAction Stop
+                                
+                                # After enabling, retrieve the recovery key and save it.
+                                $RecoveryKey = (Get-BitLockerVolume -MountPoint 'C:').KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'}
+                                if ($RecoveryKey) {
+                                    $KeyInfo = "BitLocker Recovery Key for $($env:COMPUTERNAME) - Drive C:`n`n"
+                                    $KeyInfo += "Identifier: $($RecoveryKey.KeyProtectorId)`n"
+                                    $KeyInfo += "Recovery Key: $($RecoveryKey.RecoveryPassword)`n`n"
+                                    $KeyInfo += "Date Generated: $(Get-Date)"
+                                    $KeyFileName = "BitLocker-Recovery-Key-$($env:COMPUTERNAME)-C-Drive.txt"
+                                    Set-Content -Path "$RecoveryKeyPath\$KeyFileName" -Value $KeyInfo
+                                    Write-Host "SUCCESS: BitLocker is now enabling. A recovery key file has been saved to your Desktop: '$KeyFileName'" -ForegroundColor Green
+                                    Write-Host "IMPORTANT: Copy this file to a USB drive or cloud storage and keep it safe!" -ForegroundColor Green
+                                }
+                            } catch {
+                                Write-Error "Failed to enable BitLocker. Error: $($_.Exception.Message)"
+                                Write-Error "This can happen if the system does not have a TPM, if Secure Boot is disabled, or other hardware requirements are not met."
+                            }
+                        } else {
+                            Write-Host "BitLocker enablement cancelled."
+                        }
+                    } else {
+                        Write-Host "Keeping BitLocker disabled."
+                    }
+                }
+            }
+        }
+    } catch {
+        # This catch block handles cases where Get-BitLockerVolume fails
+        Write-Error "Could not get BitLocker status for C:. Error: $($_.Exception.Message)"
+        Write-Warning "This usually means BitLocker is not available on this edition of Windows (e.g., Windows Home) or the necessary services are not running."
+    }
+    Write-Host "--- BitLocker Configuration Finished ---`n"
 }
+
+
 
 powercfg /change monitor-timeout-ac 45
 powercfg /change monitor-timeout-dc 15
