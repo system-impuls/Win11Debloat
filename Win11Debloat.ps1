@@ -345,7 +345,7 @@ function ReadAppslistFromFile {
 
 
 # =================================================================================================
-# NEW AND IMPROVED RemoveApps FUNCTION - Targets all users directly for reliable removal
+# NEW AND IMPROVED RemoveApps FUNCTION (v3) - With "Kill and Retry" for stubborn apps
 # =================================================================================================
 function RemoveApps {
     param (
@@ -356,17 +356,12 @@ function RemoveApps {
 
     # PERFORMANCE OPTIMIZATION: Get all user SIDs once.
     $UserSIDs = @{}
-    try {
-        Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.SID] = $_.Name }
-    } catch {
-        Write-Warning "Could not retrieve user SIDs. App removal for other users might be limited."
-    }
+    try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.SID] = $_.Name } } catch {}
 
     foreach ($App in $AppsList) {
         Write-Output "--> Attempting to remove package pattern: $App"
 
         # --- Step 1: Remove the Provisioned Package (for all future users) ---
-        # This prevents the app from being re-installed for new user accounts.
         try {
             $ProvisionedPackage = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$App*" -or $_.PackageName -like "*$App*" }
             if ($ProvisionedPackage) {
@@ -380,11 +375,8 @@ function RemoveApps {
             Write-Warning "  - Could not remove provisioned package for pattern '$App'. Error: $($_.Exception.Message)"
         }
 
-
         # --- Step 2: Remove the App for All Existing Users ---
-        # This iterates through every user on the system and removes the app specifically for them.
         try {
-            # Get all packages for all users that match the app name
             $PackagesToRemove = Get-AppxPackage -AllUsers -Name "*$App*" -ErrorAction SilentlyContinue
             if ($PackagesToRemove) {
                 Write-Host "  - Found installed packages matching pattern '$App'. Targeting for removal across all users..." -ForegroundColor DarkGray
@@ -392,17 +384,41 @@ function RemoveApps {
                 foreach ($Package in $PackagesToRemove) {
                     $PackageFullName = $Package.PackageFullName
                     $PackageUserSID = $Package.PackageUserInformation.UserSecurityId.Value
-                    $UserName = $UserSIDs[$PackageUserSID] # Look up username from our cached list
+                    $UserName = $UserSIDs[$PackageUserSID] # Look up username
 
                     Write-Host "    - Removing '$PackageFullName' for user: $UserName (SID: $PackageUserSID)..."
                     try {
-                        # Target the removal for the specific user via their SID
+                        # First attempt at removal
                         Remove-AppxPackage -Package $PackageFullName -AllUsers -ErrorAction Stop | Out-Null
-                        Write-Host "      ...Success."
+                        Write-Host "      ...Success on first attempt."
                     } catch {
-                        # This catch block handles cases where the package is part of the system or stubborn.
-                        Write-Warning "      ...Failed to remove package '$PackageFullName' for user '$UserName'. It may be a core component or in use."
-                        Write-Verbose "      Error details: $($_.Exception.Message)"
+                        # --- AGGRESSIVE REMOVAL LOGIC ---
+                        Write-Warning "      ...Initial removal failed. Attempting aggressive removal (terminating related processes)."
+                        
+                        try {
+                            # Find the executable name from the package's install location
+                            $InstallLocation = $Package.InstallLocation
+                            $AppxManifest = Get-AppxPackageManifest -Package $Package.PackageFullName
+                            $AppExecutable = $AppxManifest.Package.Applications.Application.Executable
+
+                            if ($AppExecutable) {
+                                # Get the process name from the executable path
+                                $ProcessName = ($AppExecutable -split '\\')[-1].Replace(".exe", "")
+                                Write-Verbose "      Terminating process: $ProcessName"
+                                Stop-Process -Name $ProcessName -Force -ErrorAction SilentlyContinue
+                                Start-Sleep -Seconds 1 # Brief pause
+                            } else {
+                                Write-Warning "      Could not determine executable name to terminate."
+                            }
+
+                            # Second attempt at removal
+                            Write-Host "      ...Retrying removal of '$PackageFullName'..."
+                            Remove-AppxPackage -Package $PackageFullName -AllUsers -ErrorAction Stop | Out-Null
+                            Write-Host "      ...Success on second attempt."
+                        } catch {
+                            Write-Warning "      ...AGGRESSIVE REMOVAL FAILED for package '$PackageFullName'."
+                            Write-Verbose "      Final error details: $($_.Exception.Message)"
+                        }
                     }
                 }
             } else {
