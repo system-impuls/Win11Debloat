@@ -1090,7 +1090,7 @@ powercfg /change standby-timeout-dc 60
 
 Set-Volume -DriveLetter 'C' -NewFileSystemLabel 'System'
 Rename-NetAdapter -Name "Ethernet" -NewName "LAN"
-Rename-NetAdapter -Name "*luetooth*" -NewName "BLE"
+Rename-NetAdapter -Name "Bluetooth*" -NewName "BLE"
 $promotionAttempted = Set-WindowsSecurityIconPromoted
  if ($promotionAttempted) {
      Write-Host "Windows Security Icon promotion script executed. Check if changes were applied after Explorer restart."
