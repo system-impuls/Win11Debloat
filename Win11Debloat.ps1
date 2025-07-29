@@ -782,73 +782,68 @@ function AwaitKeyToExit {
 
 function Set-WindowsSecurityIconPromoted {
     [CmdletBinding()]
-    [OutputType([bool])] # Specifies that the function returns a boolean
+    [OutputType([bool])]
     param()
 
-    # The core string to search for within the ExecutablePath value (case-insensitive)
-    $TargetExeSubstring = "securityhealthsystray" 
-    
-    $RegistryBaseKey = "HKCU:\Control Panel\NotifyIconSettings"
-    # The specific registry value name to check for the executable path
-    $PropertyNameToCheck = "ExecutablePath" 
-    
-    $PromotedValueName = "IsPromoted" # The DWORD value that controls visibility (1 = visible, 0 = overflow)
-    $Success = $false
+    # This is an HKCU setting, so we must apply it to all users and the default profile.
+    $TargetExeSubstring = "securityhealthsystray"
+    $PropertyNameToCheck = "ExecutablePath"
+    $PromotedValueName = "IsPromoted"
+    $OverallSuccess = $true
 
-    Write-Verbose "Function Set-WindowsSecurityIconPromoted: Attempting to find and promote Windows Security icon by checking for '$TargetExeSubstring' in '$PropertyNameToCheck'."
-
-    try {
-        # Check if the base registry key exists
-        if (-not (Test-Path $RegistryBaseKey)) {
-            Write-Warning "Registry path '$RegistryBaseKey' does not exist. Cannot proceed."
-            return $false
-        }
-
-        # Get all child items (subkeys) under the base key
-        $SubKeyItems = Get-ChildItem -Path $RegistryBaseKey -ErrorAction SilentlyContinue
-        
-        if ($null -eq $SubKeyItems -or $SubKeyItems.Count -eq 0) {
-            Write-Warning "No subkeys found under '$RegistryBaseKey'."
-            return $false
-        }
-
-        # Iterate through each subkey
-        foreach ($KeyItem in $SubKeyItems) {
-            $KeyPath = $KeyItem.PSPath
-            Write-Verbose "Processing key: $KeyPath"
-            
-            # Attempt to get the value of the specified property (e.g., "ExecutablePath")
-            $ActualExecutablePathValue = Get-ItemPropertyValue -Path $KeyPath -Name $PropertyNameToCheck -ErrorAction SilentlyContinue
-
-            # Check if the retrieved path value is not null and contains the target substring (case-insensitive)
-            if ($null -ne $ActualExecutablePathValue -and $ActualExecutablePathValue.ToString().ToLower().Contains($TargetExeSubstring.ToLower())) {
-                Write-Host "Found target application key for Windows Security: $KeyPath"
-                Write-Host " (Property '$PropertyNameToCheck' with value '$ActualExecutablePathValue' contains '$TargetExeSubstring')"
+    $SetRegValue = {
+        param($BaseKey)
+        $Success = $false
+        Get-ChildItem -Path $BaseKey -ErrorAction SilentlyContinue | ForEach-Object {
+            $KeyPath = $_.PSPath
+            $ActualPathValue = Get-ItemPropertyValue -Path $KeyPath -Name $PropertyNameToCheck -ErrorAction SilentlyContinue
+            if ($null -ne $ActualPathValue -and $ActualPathValue.ToString().ToLower().Contains($TargetExeSubstring.ToLower())) {
                 try {
-                    # Set the IsPromoted value to 1 (DWORD)
                     Set-ItemProperty -Path $KeyPath -Name $PromotedValueName -Value 1 -Type DWord -Force -ErrorAction Stop
-                    Write-Host " - Successfully set '$PromotedValueName = 1' for Windows Security icon."
                     $Success = $true
-                    break # Exit loop after finding and modifying the correct key
-                }
-                catch {
-                    Write-Warning " - Failed to set '$PromotedValueName' for '$KeyPath'. Error: $($_.Exception.Message)"
-                    # Continue to next key in case of failure, though 'break' would prevent this if successful prior.
-                }
+                    break
+                } catch {}
             }
         }
+        return $Success
+    }
 
-        if (-not $Success) {
-            Write-Warning "Could not find the Windows Security icon's settings by checking for '$TargetExeSubstring' in property '$PropertyNameToCheck' within any subkeys, or failed to update its 'IsPromoted' status."
+    Write-Host "Promoting Windows Security icon for all users..."
+
+    # 1. Apply to Default User (for new users)
+    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+    if (Test-Path $DefaultUserPath) {
+        try {
+            reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
+            if (& $SetRegValue "HKU:\DefaultUserHive\Control Panel\NotifyIconSettings") {
+                Write-Host " - Security icon promoted for Default User profile." -ForegroundColor DarkGray
+            }
+        } catch { } finally { reg unload "HKU\DefaultUserHive" | Out-Null }
+    }
+
+    # 2. Apply to all existing users
+    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+        $UserProfile = $_
+        $NTUserDataFile = Join-Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
+        if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
+        $UserSID = (Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value
+        if (-not $UserSID) { return }
+
+        if (Test-Path "Registry::HKEY_USERS\$UserSID") {
+            if (& $SetRegValue "HKU:\$UserSID\Control Panel\NotifyIconSettings") {
+                Write-Host " - Security icon promoted for logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
+            }
+        } else {
+            try {
+                reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
+                if (& $SetRegValue "HKU:\TempUserHive\Control Panel\NotifyIconSettings") {
+                    Write-Host " - Security icon promoted for user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
+                }
+            } catch { } finally { reg unload "HKU\TempUserHive" | Out-Null }
         }
     }
-    catch {
-        Write-Error "An unexpected error occurred in Set-WindowsSecurityIconPromoted: $($_.Exception.Message)"
-        # $Success remains $false or is implicitly $false
-    }
-
-    Write-Verbose "Function Set-WindowsSecurityIconPromoted: Finished. Overall success: $Success"
-    return $Success
+    
+    return $OverallSuccess
 }
 
 function Set-WindowsNtpServer {
