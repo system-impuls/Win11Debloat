@@ -65,7 +65,61 @@ if ($ExecutionContext.SessionState.LanguageMode -ne "FullLanguage") {
     Read-Host | Out-Null
     Exit
 }
+# =================================================================================================
+# NEW HELPER FUNCTION - Executes a command in the current interactive user's session
+# This is crucial for removing apps without restarting explorer.exe
+# =================================================================================================
+function Invoke-AsCurrentUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$ScriptBlock
+    )
 
+    # Find the session of the currently logged-in user on the console
+    $ExplorerProcess = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $ExplorerProcess) {
+        Write-Warning "Could not find an active explorer.exe session. Cannot run command in user context."
+        return
+    }
+    $SessionId = $ExplorerProcess.SessionId
+
+    # Use the psexec utility from Sysinternals, which needs to be available.
+    # We will embed it directly into the script to avoid external dependencies.
+    # For simplicity here, we assume a helper executable exists. A more advanced script would embed it.
+    # As an alternative, we use a scheduled task approach which is native but more complex.
+    
+    # --- Native Scheduled Task Approach (no external tools needed) ---
+    $TaskName = "Win11Debloat-TempTask-$(Get-Random)"
+    $Command = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$($ScriptBlock.ToString())`""
+    $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c $Command"
+    
+    # Get the user associated with the explorer process
+    $User = $ExplorerProcess.GetOwner().User
+    $Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive
+    
+    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+    
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Principal $Principal -Settings $Settings -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $TaskName
+        
+        # Wait a reasonable time for the task to complete
+        Start-Sleep -Seconds 3 
+        $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        while ($Task.State -eq 'Running') {
+            Start-Sleep -Seconds 1
+            $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-Warning "Failed to execute command as current user via scheduled task. Error: $($_.Exception.Message)"
+    }
+    finally {
+        # Clean up the temporary task
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
 
 # Shows application selection form that allows the user to select what apps they want to remove or keep
 function ShowAppSelectionForm {
@@ -344,8 +398,9 @@ function ReadAppslistFromFile {
 }
 
 
+
 # =================================================================================================
-# NEW AND IMPROVED RemoveApps FUNCTION (v3) - With "Kill and Retry" for stubborn apps
+# FINAL RemoveApps FUNCTION (v5) - Uses "Invoke-AsCurrentUser" for stubborn apps. NO Explorer restart.
 # =================================================================================================
 function RemoveApps {
     param (
@@ -354,82 +409,59 @@ function RemoveApps {
 
     Write-Host "> Processing removal for $($AppsList.Count) app(s)/package(s)..." -ForegroundColor Yellow
 
-    # PERFORMANCE OPTIMIZATION: Get all user SIDs once.
-    $UserSIDs = @{}
-    try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.SID] = $_.Name } } catch {}
+    # List of known stubborn apps that need to be removed in the user's own context
+    $StubbornAppPatterns = @('Microsoft.Copilot', 'Microsoft.OutlookForWindows', 'MicrosoftTeams')
 
-    foreach ($App in $AppsList) {
-        Write-Output "--> Attempting to remove package pattern: $App"
+    foreach ($AppPattern in $AppsList) {
+        Write-Output "--> Attempting to remove package pattern: $AppPattern"
 
-        # --- Step 1: Remove the Provisioned Package (for all future users) ---
+        # --- Step 1: Remove the Provisioned Package (for future users) ---
+        # This part remains the same and runs as Administrator.
         try {
-            $ProvisionedPackage = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$App*" -or $_.PackageName -like "*$App*" }
+            $ProvisionedPackage = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
             if ($ProvisionedPackage) {
-                Write-Host "  - Found provisioned package: $($ProvisionedPackage.PackageName). Removing..." -ForegroundColor DarkGray
+                Write-Host "  - Removing provisioned package: $($ProvisionedPackage.PackageName)..." -ForegroundColor DarkGray
                 $ProvisionedPackage | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction Stop | Out-Null
-                Write-Host "    Provisioned package removed."
-            } else {
-                Write-Verbose "  - No matching provisioned package found for pattern '$App'."
             }
-        } catch {
-            Write-Warning "  - Could not remove provisioned package for pattern '$App'. Error: $($_.Exception.Message)"
-        }
+        } catch { Write-Warning "  - Could not remove provisioned package for '$AppPattern'. Error: $($_.Exception.Message)" }
 
         # --- Step 2: Remove the App for All Existing Users ---
-        try {
-            $PackagesToRemove = Get-AppxPackage -AllUsers -Name "*$App*" -ErrorAction SilentlyContinue
-            if ($PackagesToRemove) {
-                Write-Host "  - Found installed packages matching pattern '$App'. Targeting for removal across all users..." -ForegroundColor DarkGray
-                
-                foreach ($Package in $PackagesToRemove) {
-                    $PackageFullName = $Package.PackageFullName
-                    $PackageUserSID = $Package.PackageUserInformation.UserSecurityId.Value
-                    $UserName = $UserSIDs[$PackageUserSID] # Look up username
-
-                    Write-Host "    - Removing '$PackageFullName' for user: $UserName (SID: $PackageUserSID)..."
-                    try {
-                        # First attempt at removal
-                        Remove-AppxPackage -Package $PackageFullName -AllUsers -ErrorAction Stop | Out-Null
-                        Write-Host "      ...Success on first attempt."
-                    } catch {
-                        # --- AGGRESSIVE REMOVAL LOGIC ---
-                        Write-Warning "      ...Initial removal failed. Attempting aggressive removal (terminating related processes)."
-                        
-                        try {
-                            # Find the executable name from the package's install location
-                            $InstallLocation = $Package.InstallLocation
-                            $AppxManifest = Get-AppxPackageManifest -Package $Package.PackageFullName
-                            $AppExecutable = $AppxManifest.Package.Applications.Application.Executable
-
-                            if ($AppExecutable) {
-                                # Get the process name from the executable path
-                                $ProcessName = ($AppExecutable -split '\\')[-1].Replace(".exe", "")
-                                Write-Verbose "      Terminating process: $ProcessName"
-                                Stop-Process -Name $ProcessName -Force -ErrorAction SilentlyContinue
-                                Start-Sleep -Seconds 1 # Brief pause
-                            } else {
-                                Write-Warning "      Could not determine executable name to terminate."
-                            }
-
-                            # Second attempt at removal
-                            Write-Host "      ...Retrying removal of '$PackageFullName'..."
-                            Remove-AppxPackage -Package $PackageFullName -AllUsers -ErrorAction Stop | Out-Null
-                            Write-Host "      ...Success on second attempt."
-                        } catch {
-                            Write-Warning "      ...AGGRESSIVE REMOVAL FAILED for package '$PackageFullName'."
-                            Write-Verbose "      Final error details: $($_.Exception.Message)"
-                        }
-                    }
-                }
-            } else {
-                 Write-Verbose "  - No matching installed packages found for pattern '$App' on any user profile."
+        # This now uses a special technique for stubborn apps.
+        $IsStubborn = $false
+        foreach ($Pattern in $StubbornAppPatterns) {
+            if ($AppPattern -like "*$Pattern*") {
+                $IsStubborn = $true
+                break
             }
-        } catch {
-            Write-Warning "  - An error occurred while trying to find or remove packages for pattern '$App'. Error: $($_.Exception.Message)"
+        }
+        
+        if ($IsStubborn) {
+            Write-Host "  - Using special removal method for stubborn app: $AppPattern" -ForegroundColor Cyan
+            # For stubborn apps, we execute the removal command in the active user's session.
+            # This correctly handles shell integration without needing an explorer restart.
+            $Command = {
+                param($Pattern)
+                $Package = Get-AppxPackage -Name "*$Pattern*"
+                if ($Package) {
+                    Remove-AppxPackage -Package $Package.PackageFullName -ErrorAction SilentlyContinue
+                }
+            }
+            Invoke-AsCurrentUser -ScriptBlock $Command -ArgumentList $AppPattern
+        }
+        else {
+            # For normal apps, the previous admin-context removal is fine.
+            try {
+                $PackagesToRemove = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
+                if ($PackagesToRemove) {
+                    Write-Host "  - Removing standard app packages for '$AppPattern'..." -ForegroundColor DarkGray
+                    $PackagesToRemove | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+                }
+            } catch { Write-Warning "  - An error occurred while removing standard package for '$AppPattern'. Error: $($_.Exception.Message)" }
         }
     }
     Write-Output ""
 }
+
 
 
 # Forcefully removes Microsoft Edge using it's uninstaller
