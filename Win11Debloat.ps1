@@ -921,7 +921,7 @@ function Disable-EdgeStandardAutostart {
     param()
 
     $EdgeExecutableName = "msedge.exe"
-    $ItemsActuallyRemoved = $false # Track if any item was successfully removed
+    $ItemsActuallyRemoved = $false
 
     # --- Registry Run Keys ---
     $RunKeyRegistryPaths = @(
@@ -932,29 +932,34 @@ function Disable-EdgeStandardAutostart {
     )
     foreach ($KeyPath in $RunKeyRegistryPaths) {
         if (Test-Path $KeyPath) {
-            Get-ItemProperty -Path $KeyPath -ErrorAction SilentlyContinue | Get-Member -MemberType NoteProperty | ForEach-Object {
-                $ValueName = $_.Name
-                if ($ValueName -in @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider", "PSIsContainer", "(default)")) { return }
+            # FIX: Check if Get-ItemProperty returns a valid object before piping to Get-Member
+            $Properties = Get-ItemProperty -Path $KeyPath -ErrorAction SilentlyContinue
+            if ($null -ne $Properties) {
+                $Properties | Get-Member -MemberType NoteProperty | ForEach-Object {
+                    $ValueName = $_.Name
+                    if ($ValueName -in @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider", "PSIsContainer", "(default)")) { return }
 
-                $CommandData = Get-ItemPropertyValue -Path $KeyPath -Name $ValueName -ErrorAction SilentlyContinue
-                if ($CommandData -is [string] -and $CommandData.ToLower().Contains($EdgeExecutableName.ToLower())) {
-                    try {
-                        Remove-ItemProperty -Path $KeyPath -Name $ValueName -Force -ErrorAction Stop
-                        Write-Host "Removed Edge autostart (Registry): '$ValueName' from '$KeyPath'"
-                        $ItemsActuallyRemoved = $true
-                    } catch {
-                        Write-Warning "Failed to remove Edge autostart (Registry): '$ValueName' from '$KeyPath'. Error: $($_.Exception.Message)"
+                    $CommandData = Get-ItemPropertyValue -Path $KeyPath -Name $ValueName -ErrorAction SilentlyContinue
+                    if ($CommandData -is [string] -and $CommandData.ToLower().Contains($EdgeExecutableName.ToLower())) {
+                        try {
+                            Remove-ItemProperty -Path $KeyPath -Name $ValueName -Force -ErrorAction Stop
+                            Write-Host "Removed Edge autostart (Registry): '$ValueName' from '$KeyPath'"
+                            $ItemsActuallyRemoved = $true
+                        } catch {
+                            Write-Warning "Failed to remove Edge autostart (Registry): '$ValueName'. Error: $($_.Exception.Message)"
+                        }
                     }
                 }
             }
         }
     }
 
-    # --- Startup Folders ---
+    # --- Startup Folders Logic (No change needed here) ---
     $StartupFolderPathsToScan = @(
         [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup),
         [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
     )
+    # ... (the rest of the startup folder logic is fine)
     foreach ($FolderPath in $StartupFolderPathsToScan) {
         if (Test-Path $FolderPath) {
             Get-ChildItem -Path $FolderPath -Filter "*.lnk" -File -ErrorAction SilentlyContinue | ForEach-Object {
@@ -971,7 +976,7 @@ function Disable-EdgeStandardAutostart {
                              Write-Warning "Failed to remove Edge autostart (Shortcut): '$($ShortcutFile.FullName)'. Error: $($_.Exception.Message)"
                         }
                     }
-                } catch {} # Silently continue if inspecting a shortcut fails
+                } catch {}
             }
         }
     }
