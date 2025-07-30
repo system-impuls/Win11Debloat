@@ -1175,23 +1175,54 @@ else {
 
 Write-Host "`n--- Configuring Autostart Programs ---"
 
-# Disable Edge Autostart
-if (Set-ProgramAutostart -ExecutableName "msedge.exe" -Action "Disable") {
-    Write-Host "Edge autostart entries were successfully targeted for removal."
+# =================================================================================================
+# NEW INTERACTIVE AUTOSART CONFIGURATION SECTION
+# =================================================================================================
+
+Write-Host "`n--- Interactive Autostart Configuration ---" -ForegroundColor Yellow
+
+# --- Configure Microsoft Edge Autostart ---
+$choiceEdge = Read-Host "Do you want to disable Microsoft Edge from starting automatically? (y/n)"
+if ($choiceEdge -eq 'y') {
+    if (Set-ProgramAutostart -ExecutableName "msedge.exe" -Action "Disable") {
+        Write-Host "Microsoft Edge autostart has been disabled." -ForegroundColor Green
+    } else {
+        Write-Host "No active Microsoft Edge autostart entries were found to disable."
+    }
 } else {
-    Write-Host "No active Edge autostart entries were found to disable."
+    Write-Host "Skipping Microsoft Edge autostart configuration."
 }
+Write-Output "" # Add a blank line for readability
 
-# Disable OneDrive Autostart
-if (Set-ProgramAutostart -ExecutableName "OneDrive.exe" -Action "Disable") {
-    Write-Host "OneDrive autostart entries were successfully targeted for removal/disabling."
+# --- Configure OneDrive Autostart ---
+$choiceOneDrive = Read-Host "Do you want to disable OneDrive from starting automatically? (y/n)"
+if ($choiceOneDrive -eq 'y') {
+    if (Set-ProgramAutostart -ExecutableName "OneDrive.exe" -Action "Disable") {
+        Write-Host "OneDrive autostart has been disabled." -ForegroundColor Green
+    } else {
+        Write-Host "No active OneDrive autostart entries were found to disable."
+    }
 } else {
-    Write-Host "No active OneDrive autostart entries were found to disable."
+    Write-Host "Skipping OneDrive autostart configuration."
 }
+Write-Output "" # Add a blank line for readability
 
-# Example: How you could disable Teams autostart in the future
-# Set-ProgramAutostart -ExecutableName "ms-teams.exe" -Action "Disable"
+# --- Example for Future Use: Microsoft Teams ---
+# You can uncomment this block later if you add Teams to your debloat.
+# $choiceTeams = Read-Host "Do you want to disable Microsoft Teams from starting automatically? (y/n)"
+# if ($choiceTeams -eq 'y') {
+#     # Note: You might need to check if the executable is Teams.exe or ms-teams.exe
+#     if (Set-ProgramAutostart -ExecutableName "Teams.exe" -Action "Disable") {
+#         Write-Host "Microsoft Teams autostart has been disabled." -ForegroundColor Green
+#     } else {
+#         Write-Host "No active Microsoft Teams autostart entries were found to disable."
+#     }
+# } else {
+#     Write-Host "Skipping Microsoft Teams autostart configuration."
+# }
+# Write-Output ""
 
+Write-Host "--- Autostart Configuration Finished ---"
 
 # Change NTP Server
 if (Set-WindowsNtpServer -NtpServerAddress "de.pool.ntp.org") { # Or your desired server
