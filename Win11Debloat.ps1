@@ -892,72 +892,139 @@ function Set-WindowsNtpServer {
     return $OverallSuccess
 }
 
-function Disable-EdgeStandardAutostart {
+# =================================================================================================
+# NEW GENERIC FUNCTION - Disables or Enables Autostart for any specified program.
+# This one function can replace both Disable-EdgeStandardAutostart and Disable-OneDriveAutostart.
+# =================================================================================================
+function Set-ProgramAutostart {
     [CmdletBinding()]
     [OutputType([bool])]
-    param()
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutableName,
 
-    $EdgeExecutableName = "msedge.exe"
-    $ItemsActuallyRemoved = $false
-
-    # --- Registry Run Keys ---
-    $RunKeyRegistryPaths = @(
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+        [ValidateSet('Disable', 'Enable')]
+        [string]$Action = 'Disable' # Default action is to disable
     )
-    foreach ($KeyPath in $RunKeyRegistryPaths) {
-        if (Test-Path $KeyPath) {
-            # FIX: Check if Get-ItemProperty returns a valid object before piping to Get-Member
-            $Properties = Get-ItemProperty -Path $KeyPath -ErrorAction SilentlyContinue
-            if ($null -ne $Properties) {
-                $Properties | Get-Member -MemberType NoteProperty | ForEach-Object {
-                    $ValueName = $_.Name
-                    if ($ValueName -in @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider", "PSIsContainer", "(default)")) { return }
 
-                    $CommandData = Get-ItemPropertyValue -Path $KeyPath -Name $ValueName -ErrorAction SilentlyContinue
-                    if ($CommandData -is [string] -and $CommandData.ToLower().Contains($EdgeExecutableName.ToLower())) {
+    Write-Host "> Configuring Autostart for '$ExecutableName' to be '$Action'd..." -ForegroundColor Yellow
+    $ItemsChanged = $false
+
+    # --- 1. Registry Run Keys (for All Users) ---
+    $RunKeyValueName = Split-Path $ExecutableName -Leaf | ForEach-Object { $_.Split('.')[0] } # e.g., "msedge.exe" -> "msedge"
+
+    if ($Action -eq 'Disable') {
+        Write-Host "  - Removing '$ExecutableName' Run key for all users..."
+        # We need to load each user's hive to remove the value
+        $RemoveRunKeyAction = {
+            param($KeyName)
+            $RunKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+            # Find any value where the command contains the exe name
+            $Values = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
+            if ($null -ne $Values) {
+                $Properties = $Values | Get-Member -MemberType NoteProperty
+                foreach ($Property in $Properties) {
+                    $ValueName = $Property.Name
+                    $CommandData = $Values.$ValueName
+                    if ($CommandData -is [string] -and $CommandData.ToLower().Contains($ExecutableName.ToLower())) {
                         try {
-                            Remove-ItemProperty -Path $KeyPath -Name $ValueName -Force -ErrorAction Stop
-                            Write-Host "Removed Edge autostart (Registry): '$ValueName' from '$KeyPath'"
-                            $ItemsActuallyRemoved = $true
-                        } catch {
-                            Write-Warning "Failed to remove Edge autostart (Registry): '$ValueName'. Error: $($_.Exception.Message)"
-                        }
+                            Remove-ItemProperty -Path $RunKeyPath -Name $ValueName -Force -ErrorAction Stop
+                            return $true # Return true if removal was successful
+                        } catch { }
                     }
+                }
+            }
+            return $false # Return false if nothing was removed
+        }
+
+        # Apply to Default User
+        $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+        if (Test-Path $DefaultUserPath) {
+            try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $RemoveRunKeyAction) { $ItemsChanged = $true } } catch { } finally { reg unload "HKU\DefaultUserHive" | Out-Null }
+        }
+
+        # Apply to all existing users
+        Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+            $UserProfile = $_
+            $NTUserDataFile = Join-Path -Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
+            if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
+            $UserSID = (Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value
+            if (-not $UserSID) { return }
+
+            if (Test-Path "Registry::HKEY_USERS\$UserSID") {
+                Push-Location "HKU:\$UserSID"; if (& $RemoveRunKeyAction) { $ItemsChanged = $true }; Pop-Location
+            } else {
+                try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; Push-Location "HKU:\TempUserHive"; if (& $RemoveRunKeyAction) { $ItemsChanged = $true }; Pop-Location } catch { } finally { reg unload "HKU\TempUserHive" | Out-Null }
+            }
+        }
+    }
+    # Note: Logic for 'Enable' would be more complex as it requires knowing the exact command path,
+    # so for now we focus on the primary 'Disable' use case.
+
+    # --- 2. Startup Folders ---
+    if ($Action -eq 'Disable') {
+        Write-Host "  - Removing '$ExecutableName' shortcuts from Startup folders..."
+        $StartupFolderPathsToScan = @(
+            [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup),
+            [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
+        )
+        foreach ($FolderPath in $StartupFolderPathsToScan) {
+            if (Test-Path $FolderPath) {
+                Get-ChildItem -Path $FolderPath -Filter "*.lnk" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                    $ShortcutFile = $_
+                    try {
+                        $Shell = New-Object -ComObject WScript.Shell
+                        $Link = $Shell.CreateShortcut($ShortcutFile.FullName)
+                        if ($Link.TargetPath -is [string] -and $Link.TargetPath.ToLower().Contains($ExecutableName.ToLower())) {
+                            try {
+                                Remove-Item -Path $ShortcutFile.FullName -Force -ErrorAction Stop
+                                Write-Host "    Removed shortcut: '$($ShortcutFile.FullName)'"
+                                $ItemsChanged = $true
+                            } catch { Write-Warning "    Failed to remove shortcut: '$($ShortcutFile.FullName)'" }
+                        }
+                    } catch {}
                 }
             }
         }
     }
 
-    # --- Startup Folders Logic (No change needed here) ---
-    $StartupFolderPathsToScan = @(
-        [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup),
-        [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
-    )
-    # ... (the rest of the startup folder logic is fine)
-    foreach ($FolderPath in $StartupFolderPathsToScan) {
-        if (Test-Path $FolderPath) {
-            Get-ChildItem -Path $FolderPath -Filter "*.lnk" -File -ErrorAction SilentlyContinue | ForEach-Object {
-                $ShortcutFile = $_
+    # --- 3. Scheduled Tasks ---
+    if ($Action -eq 'Disable') {
+        Write-Host "  - Disabling scheduled tasks related to '$ExecutableName'..."
+        # Get a simplified name for searching tasks (e.g., "onedrive")
+        $TaskSearchPattern = ($ExecutableName -split ".exe")[0]
+        $Tasks = Get-ScheduledTask | Where-Object { $_.TaskPath -like "\*" -and ($_.TaskName -like "*$TaskSearchPattern*" -or $_.Actions.Execute -like "*$ExecutableName*") }
+        if ($Tasks) {
+            foreach ($Task in $Tasks) {
                 try {
-                    $Shell = New-Object -ComObject WScript.Shell
-                    $Link = $Shell.CreateShortcut($ShortcutFile.FullName)
-                    if ($Link.TargetPath -is [string] -and $Link.TargetPath.ToLower().Contains($EdgeExecutableName.ToLower())) {
-                        try {
-                            Remove-Item -Path $ShortcutFile.FullName -Force -ErrorAction Stop
-                            Write-Host "Removed Edge autostart (Shortcut): '$($ShortcutFile.FullName)'"
-                            $ItemsActuallyRemoved = $true
-                        } catch {
-                             Write-Warning "Failed to remove Edge autostart (Shortcut): '$($ShortcutFile.FullName)'. Error: $($_.Exception.Message)"
-                        }
-                    }
-                } catch {}
+                    Disable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
+                    Write-Host "    Disabled task: $($Task.TaskName)"
+                    $ItemsChanged = $true
+                } catch { Write-Warning "    Failed to disable task: $($Task.TaskName)" }
             }
         }
     }
-    return $ItemsActuallyRemoved
+
+    # --- 4. Special Policies (e.g., OneDrive) ---
+    # This part is specific, so we handle it with a switch
+    switch ($ExecutableName) {
+        "OneDrive.exe" {
+            if ($Action -eq 'Disable') {
+                Write-Host "  - Setting Group Policy to prevent OneDrive usage..."
+                $PolicyPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
+                $PolicyName = "DisableFileSyncNGSC"
+                try {
+                    if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
+                    Set-ItemProperty -Path $PolicyPath -Name $PolicyName -Value 1 -Type DWord -Force -ErrorAction Stop
+                    $ItemsChanged = $true
+                } catch { Write-Warning "  Failed to set OneDrive Group Policy." }
+            }
+        }
+        # You can add more 'case' statements here for other apps with specific policies
+        # "Teams.exe" { ... }
+    }
+
+    return $ItemsChanged
 }
 ##################################################################################################################
 #                                                                                                                #
@@ -1106,12 +1173,25 @@ else {
     }
 }
 
+Write-Host "`n--- Configuring Autostart Programs ---"
+
 # Disable Edge Autostart
-if (Disable-EdgeStandardAutostart) {
-    Write-Host "Edge autostart disable function: One or more items were removed."
+if (Set-ProgramAutostart -ExecutableName "msedge.exe" -Action "Disable") {
+    Write-Host "Edge autostart entries were successfully targeted for removal."
 } else {
-    Write-Host "Edge autostart disable function: No items found or no items successfully removed."
+    Write-Host "No active Edge autostart entries were found to disable."
 }
+
+# Disable OneDrive Autostart
+if (Set-ProgramAutostart -ExecutableName "OneDrive.exe" -Action "Disable") {
+    Write-Host "OneDrive autostart entries were successfully targeted for removal/disabling."
+} else {
+    Write-Host "No active OneDrive autostart entries were found to disable."
+}
+
+# Example: How you could disable Teams autostart in the future
+# Set-ProgramAutostart -ExecutableName "ms-teams.exe" -Action "Disable"
+
 
 # Change NTP Server
 if (Set-WindowsNtpServer -NtpServerAddress "de.pool.ntp.org") { # Or your desired server
