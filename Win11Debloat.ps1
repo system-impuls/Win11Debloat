@@ -872,8 +872,8 @@ function Set-WindowsNtpServer {
 }
 
 # =================================================================================================
-# NEW GENERIC FUNCTION - Disables or Enables Autostart for any specified program.
-# This one function can replace both Disable-EdgeStandardAutostart and Disable-OneDriveAutostart.
+# =================================================================================================
+# FINAL, RELIABLE Set-ProgramAutostart FUNCTION (v2) - Direct and Correct
 # =================================================================================================
 function Set-ProgramAutostart {
     [CmdletBinding()]
@@ -883,126 +883,95 @@ function Set-ProgramAutostart {
         [string]$ExecutableName,
 
         [ValidateSet('Disable', 'Enable')]
-        [string]$Action = 'Disable' # Default action is to disable
+        [string]$Action = 'Disable'
     )
 
     Write-Host "> Configuring Autostart for '$ExecutableName' to be '$Action'd..." -ForegroundColor Yellow
     $ItemsChanged = $false
 
-    # --- 1. Registry Run Keys (for All Users) ---
-    $RunKeyValueName = Split-Path $ExecutableName -Leaf | ForEach-Object { $_.Split('.')[0] } # e.g., "msedge.exe" -> "msedge"
-
-    if ($Action -eq 'Disable') {
-        Write-Host "  - Removing '$ExecutableName' Run key for all users..."
-        # We need to load each user's hive to remove the value
-        $RemoveRunKeyAction = {
-            param($KeyName)
-            $RunKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    # --- Action for a single user's hive ---
+    # This scriptblock will be executed for each user.
+    $UserHiveAction = {
+        param($HivePath)
+        $HiveItemsChanged = $false
+        # 1. Registry Run Key
+        $RunKeyPath = Join-Path -Path $HivePath -ChildPath "Software\Microsoft\Windows\CurrentVersion\Run"
+        if (Test-Path $RunKeyPath) {
             # Find any value where the command contains the exe name
             $Values = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
             if ($null -ne $Values) {
-                $Properties = $Values | Get-Member -MemberType NoteProperty
+                $Properties = $Values.PSObject.Properties | Where-Object { $_.IsGettable -and $_.Name -notin @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider", "PSIsContainer", "(default)") }
                 foreach ($Property in $Properties) {
                     $ValueName = $Property.Name
                     $CommandData = $Values.$ValueName
                     if ($CommandData -is [string] -and $CommandData.ToLower().Contains($ExecutableName.ToLower())) {
                         try {
                             Remove-ItemProperty -Path $RunKeyPath -Name $ValueName -Force -ErrorAction Stop
-                            return $true # Return true if removal was successful
+                            $HiveItemsChanged = $true
                         } catch { }
                     }
                 }
             }
-            return $false # Return false if nothing was removed
         }
-
-        # Apply to Default User
-        $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-        if (Test-Path $DefaultUserPath) {
-            try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $RemoveRunKeyAction) { $ItemsChanged = $true } } catch { } finally { reg unload "HKU\DefaultUserHive" | Out-Null }
-        }
-
-        # Apply to all existing users
-        Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-            $UserProfile = $_
-            $NTUserDataFile = Join-Path -Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
-            if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
-            $UserSID = (Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value
-            if (-not $UserSID) { return }
-
-            if (Test-Path "Registry::HKEY_USERS\$UserSID") {
-                Push-Location "HKU:\$UserSID"; if (& $RemoveRunKeyAction) { $ItemsChanged = $true }; Pop-Location
-            } else {
-                try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; Push-Location "HKU:\TempUserHive"; if (& $RemoveRunKeyAction) { $ItemsChanged = $true }; Pop-Location } catch { } finally { reg unload "HKU\TempUserHive" | Out-Null }
-            }
-        }
+        return $HiveItemsChanged
     }
-    # Note: Logic for 'Enable' would be more complex as it requires knowing the exact command path,
-    # so for now we focus on the primary 'Disable' use case.
 
-    # --- 2. Startup Folders ---
-    if ($Action -eq 'Disable') {
-        Write-Host "  - Removing '$ExecutableName' shortcuts from Startup folders..."
-        $StartupFolderPathsToScan = @(
-            [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Startup),
-            [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
-        )
-        foreach ($FolderPath in $StartupFolderPathsToScan) {
-            if (Test-Path $FolderPath) {
-                Get-ChildItem -Path $FolderPath -Filter "*.lnk" -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    $ShortcutFile = $_
-                    try {
-                        $Shell = New-Object -ComObject WScript.Shell
-                        $Link = $Shell.CreateShortcut($ShortcutFile.FullName)
-                        if ($Link.TargetPath -is [string] -and $Link.TargetPath.ToLower().Contains($ExecutableName.ToLower())) {
-                            try {
-                                Remove-Item -Path $ShortcutFile.FullName -Force -ErrorAction Stop
-                                Write-Host "    Removed shortcut: '$($ShortcutFile.FullName)'"
-                                $ItemsChanged = $true
-                            } catch { Write-Warning "    Failed to remove shortcut: '$($ShortcutFile.FullName)'" }
-                        }
-                    } catch {}
-                }
-            }
+    # --- Apply to All Users and Default Profile ---
+    Write-Host "  - Applying to all user registry hives..."
+    # Default User (for new users)
+    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+    if (Test-Path $DefaultUserPath) {
+        try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserHiveAction "HKU:\DefaultUserHive") { $ItemsChanged = $true; Write-Host "    - Removed Run key from Default User profile." } } catch { } finally { reg unload "HKU\DefaultUserHive" | Out-Null }
+    }
+
+    # All Existing Users
+    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+        $UserProfile = $_
+        $NTUserDataFile = Join-Path -Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
+        if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
+        $UserSID = (Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value
+        if (-not $UserSID) { return }
+
+        if (Test-Path "Registry::HKEY_USERS\$UserSID") {
+            if (& $UserHiveAction "HKU:\$UserSID") { $ItemsChanged = $true; Write-Host "    - Removed Run key for logged-in user: $($UserProfile.Name)" }
+        } else {
+            try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; if (& $UserHiveAction "HKU:\TempUserHive") { $ItemsChanged = $true; Write-Host "    - Removed Run key for user profile: $($UserProfile.Name)" } } catch { } finally { reg unload "HKU\TempUserHive" | Out-Null }
         }
     }
 
-    # --- 3. Scheduled Tasks ---
-    if ($Action -eq 'Disable') {
-        Write-Host "  - Disabling scheduled tasks related to '$ExecutableName'..."
-        # Get a simplified name for searching tasks (e.g., "onedrive")
-        $TaskSearchPattern = ($ExecutableName -split ".exe")[0]
-        $Tasks = Get-ScheduledTask | Where-Object { $_.TaskPath -like "\*" -and ($_.TaskName -like "*$TaskSearchPattern*" -or $_.Actions.Execute -like "*$ExecutableName*") }
-        if ($Tasks) {
-            foreach ($Task in $Tasks) {
-                try {
-                    Disable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop
-                    Write-Host "    Disabled task: $($Task.TaskName)"
-                    $ItemsChanged = $true
-                } catch { Write-Warning "    Failed to disable task: $($Task.TaskName)" }
+
+    # --- System-Wide Locations ---
+    # Startup Folders
+    Write-Host "  - Applying to system-wide Startup folders..."
+    $StartupFolderPathsToScan = @(
+        [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
+    )
+    foreach ($FolderPath in $StartupFolderPathsToScan) {
+        if (Test-Path $FolderPath) {
+            Get-ChildItem -Path $FolderPath -Filter "*.lnk" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                $ShortcutFile = $_; try { $Link = (New-Object -ComObject WScript.Shell).CreateShortcut($ShortcutFile.FullName); if ($Link.TargetPath -is [string] -and $Link.TargetPath.ToLower().Contains($ExecutableName.ToLower())) { Remove-Item -Path $ShortcutFile.FullName -Force -ErrorAction Stop; $ItemsChanged = $true; Write-Host "    - Removed shortcut: '$($ShortcutFile.FullName)'" } } catch {}
             }
         }
     }
+    
+    # Scheduled Tasks
+    Write-Host "  - Disabling system-wide scheduled tasks..."
+    $TaskSearchPattern = ($ExecutableName -split ".exe")[0]
+    $Tasks = Get-ScheduledTask | Where-Object { $_.TaskPath -like "\*" -and ($_.TaskName -like "*$TaskSearchPattern*" -or $_.Actions.Execute -like "*$ExecutableName*") }
+    if ($Tasks) {
+        $Tasks | Disable-ScheduledTask -ErrorAction SilentlyContinue
+        if ($?) { $ItemsChanged = $true; Write-Host "    - Disabled $($Tasks.Count) related scheduled task(s)." }
+    }
 
-    # --- 4. Special Policies (e.g., OneDrive) ---
-    # This part is specific, so we handle it with a switch
+    # Special Policies
     switch ($ExecutableName) {
         "OneDrive.exe" {
-            if ($Action -eq 'Disable') {
-                Write-Host "  - Setting Group Policy to prevent OneDrive usage..."
-                $PolicyPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"
-                $PolicyName = "DisableFileSyncNGSC"
-                try {
-                    if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
-                    Set-ItemProperty -Path $PolicyPath -Name $PolicyName -Value 1 -Type DWord -Force -ErrorAction Stop
-                    $ItemsChanged = $true
-                } catch { Write-Warning "  Failed to set OneDrive Group Policy." }
-            }
+            Write-Host "  - Applying OneDrive-specific Group Policy..."
+            $PolicyPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"; $PolicyName = "DisableFileSyncNGSC"
+            try { if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }; Set-ItemProperty -Path $PolicyPath -Name $PolicyName -Value 1 -Type DWord -Force -ErrorAction Stop; $ItemsChanged = $true; Write-Host "    - OneDrive usage policy set." } catch { }
         }
-        # You can add more 'case' statements here for other apps with specific policies
-        # "Teams.exe" { ... }
     }
-
+    
     return $ItemsChanged
 }
 ##################################################################################################################
