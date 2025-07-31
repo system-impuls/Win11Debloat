@@ -762,71 +762,50 @@ function AwaitKeyToExit {
     }
 }
 
+
+# =================================================================================================
+# REVERTED Set-WindowsSecurityIconPromoted FUNCTION - Simple and works for the current user
+# =================================================================================================
 function Set-WindowsSecurityIconPromoted {
     [CmdletBinding()]
     [OutputType([bool])]
     param()
 
-    # This is an HKCU setting, so we must apply it to all users and the default profile.
+    # This function targets the current user only, as this is the only reliable method.
     $TargetExeSubstring = "securityhealthsystray"
+    $RegistryBaseKey = "HKCU:\Control Panel\NotifyIconSettings"
     $PropertyNameToCheck = "ExecutablePath"
     $PromotedValueName = "IsPromoted"
-    $OverallSuccess = $true
+    $Success = $false
 
-    $SetRegValue = {
-        param($BaseKey)
-        $Success = $false
-        Get-ChildItem -Path $BaseKey -ErrorAction SilentlyContinue | ForEach-Object {
-            $KeyPath = $_.PSPath
-            $ActualPathValue = Get-ItemPropertyValue -Path $KeyPath -Name $PropertyNameToCheck -ErrorAction SilentlyContinue
-            if ($null -ne $ActualPathValue -and $ActualPathValue.ToString().ToLower().Contains($TargetExeSubstring.ToLower())) {
-                try {
-                    Set-ItemProperty -Path $KeyPath -Name $PromotedValueName -Value 1 -Type DWord -Force -ErrorAction Stop
-                    $Success = $true
-                    break
-                } catch {}
-            }
-        }
-        return $Success
-    }
-
-    Write-Host "Promoting Windows Security icon for all users..."
-
-    # 1. Apply to Default User (for new users)
-    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (Test-Path $DefaultUserPath) {
-        try {
-            reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
-            if (& $SetRegValue "HKU:\DefaultUserHive\Control Panel\NotifyIconSettings") {
-                Write-Host " - Security icon promoted for Default User profile." -ForegroundColor DarkGray
-            }
-        } catch { } finally { reg unload "HKU\DefaultUserHive" | Out-Null }
-    }
-
-    # 2. Apply to all existing users
-    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-        $UserProfile = $_
-        $NTUserDataFile = Join-Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
-        if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
-        $UserSID = (Get-CimInstance Win32_UserAccount -Filter "Name = '$($UserProfile.Name)'").SID.Value
-        if (-not $UserSID) { return }
-
-        if (Test-Path "Registry::HKEY_USERS\$UserSID") {
-            if (& $SetRegValue "HKU:\$UserSID\Control Panel\NotifyIconSettings") {
-                Write-Host " - Security icon promoted for logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
-            }
-        } else {
-            try {
-                reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
-                if (& $SetRegValue "HKU:\TempUserHive\Control Panel\NotifyIconSettings") {
-                    Write-Host " - Security icon promoted for user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
-                }
-            } catch { } finally { reg unload "HKU\TempUserHive" | Out-Null }
-        }
+    # Check if the base registry key exists
+    if (-not (Test-Path $RegistryBaseKey)) {
+        Write-Warning "Registry path '$RegistryBaseKey' does not exist for current user. Cannot proceed."
+        return $false
     }
     
-    return $OverallSuccess
+    $SubKeyItems = Get-ChildItem -Path $RegistryBaseKey -ErrorAction SilentlyContinue
+    if ($null -eq $SubKeyItems) { return $false }
+
+    foreach ($KeyItem in $SubKeyItems) {
+        $KeyPath = $KeyItem.PSPath
+        $ActualPathValue = Get-ItemPropertyValue -Path $KeyPath -Name $PropertyNameToCheck -ErrorAction SilentlyContinue
+
+        if ($null -ne $ActualPathValue -and $ActualPathValue.ToString().ToLower().Contains($TargetExeSubstring.ToLower())) {
+            Write-Host "Found target application key for Windows Security: $KeyPath"
+            try {
+                Set-ItemProperty -Path $KeyPath -Name $PromotedValueName -Value 1 -Type DWord -Force -ErrorAction Stop
+                Write-Host " - Successfully set '$PromotedValueName = 1' for Windows Security icon for current user."
+                $Success = $true
+                break # Exit loop after finding the correct key
+            } catch {
+                Write-Warning " - Failed to set '$PromotedValueName' for '$KeyPath'. Error: $($_.Exception.Message)"
+            }
+        }
+    }
+    return $Success
 }
+
 
 function Set-WindowsNtpServer {
     [CmdletBinding()]
