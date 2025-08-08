@@ -871,108 +871,101 @@ function Set-WindowsNtpServer {
     return $OverallSuccess
 }
 
-function Disable-EdgeAutostart {
+# =================================================================================================
+# DEFINITIVE GENERIC Set-ProgramAutostart FUNCTION
+# Correctly disables startup for any app by targeting StartupApproved keys for all users.
+# =================================================================================================
+function Set-ProgramAutostart {
     [CmdletBinding()]
     [OutputType([bool])]
-    param()
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutableName,
 
-    Write-Host "> Disabling Edge autostart..." -ForegroundColor Yellow
+        [Parameter(Mandatory = $false)]
+        [string]$RegistryValueName # Use this for apps with a specific, known Run key name like "OneDrive"
+    )
+
+    Write-Host "> Disabling Autostart for '$ExecutableName'..." -ForegroundColor Yellow
     $ItemsChanged = $false
-    $ExecutableName = "msedge.exe"
 
-    # --- Remove from Registry Run Key (for All Users) ---
-    $UserRegistryAction = {
+    # --- 1. Disable from Registry Run Key (for all users) using StartupApproved ---
+    # This is the modern, correct method that mirrors Task Manager's "Disable" button.
+    $UserDisableAction = {
         param($UserHivePath)
         $ActionTaken = $false
         $RunKeyPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Run"
-        if (Test-Path $RunKeyPath) {
+        $StartupApprovedPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+        $DisabledValue = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
+
+        # If a specific registry value name is provided (like "OneDrive"), target it directly.
+        if ($using:RegistryValueName) {
+            if (Get-ItemProperty -Path $RunKeyPath -Name $using:RegistryValueName -ErrorAction SilentlyContinue) {
+                try {
+                    if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
+                    Set-ItemProperty -Path $StartupApprovedPath -Name $using:RegistryValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
+                    $ActionTaken = $true
+                } catch {}
+            }
+        }
+        # Otherwise, search for any entry containing the executable name.
+        else {
             $Properties = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
             if ($null -ne $Properties) {
                 $Properties.PSObject.Properties | ForEach-Object {
-                    if ($_.Name -notin @("PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider", "PSIsContainer", "(default)")) {
-                        if ($_.Value -is [string] -and $_.Value.ToLower().Contains($ExecutableName.ToLower())) {
-                            try { Remove-ItemProperty -Path $RunKeyPath -Name $_.Name -Force -ErrorAction Stop; $ActionTaken = $true } catch {}
-                        }
+                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($using:ExecutableName.ToLower())) {
+                        $CurrentValueName = $_.Name
+                        try {
+                            if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
+                            Set-ItemProperty -Path $StartupApprovedPath -Name $CurrentValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
+                            $ActionTaken = $true
+                        } catch {}
                     }
                 }
             }
         }
         return $ActionTaken
     }
-    
-    # Apply to all users
+
+    # Apply this action to every user's registry hive
     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserRegistryAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
+    if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserDisableAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
     Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-        $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
-        if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
-        try { $UserSID = (New-Object System.Security.Principal.NTAccount($UserProfile.Name)).Translate([System.security.principal.securityidentifier]).value } catch { return }
-        if (Test-Path "Registry::HKEY_USERS\$UserSID") { if (& $UserRegistryAction "HKU:\$UserSID") { $ItemsChanged = $true } } else { try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; if (& $UserRegistryAction "HKU:\TempUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\TempUserHive" | Out-Null } }
+        $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"; if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }; try { $UserSID = (New-Object System.Security.Principal.NTAccount($UserProfile.Name)).Translate([System.security.principal.securityidentifier]).value } catch { return }; if (Test-Path "Registry::HKEY_USERS\$UserSID") { if (& $UserDisableAction "HKU:\$UserSID") { $ItemsChanged = $true } } else { try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; if (& $UserDisableAction "HKU:\TempUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\TempUserHive" | Out-Null } }
     }
-    
-    return $ItemsChanged
-}
-# =================================================================================================
-# NEW AND CORRECTED Disable-OneDriveAutostart FUNCTION - Safe Version
-# This version ONLY disables autostart and does NOT block the app from running manually.
-# =================================================================================================
-function Disable-OneDriveAutostart {
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param()
-
-    Write-Host "> Disabling OneDrive autostart (Safe Method)..." -ForegroundColor Yellow
-    $ItemsChanged = $false
-
-    # --- 1. Remove from Registry Run Key (for All Users) ---
-    # This is the primary method Task Manager uses for startup.
-    $UserRegistryAction = {
-        param($UserHivePath)
-        $ActionTaken = $false
-        $RunKeyPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Run"
-        $ValueName = "OneDrive" # OneDrive typically uses this specific name
-
-        if (Test-Path $RunKeyPath) {
-            if (Get-ItemProperty -Path $RunKeyPath -Name $ValueName -ErrorAction SilentlyContinue) {
-                try {
-                    Remove-ItemProperty -Path $RunKeyPath -Name $ValueName -Force -ErrorAction Stop
-                    $ActionTaken = $true
-                } catch {}
-            }
-        }
-        return $ActionTaken
-    }
-
-    Write-Host "  - Removing OneDrive 'Run' key from all user registries..."
-    # Apply to Default User (for new users)
-    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (Test-Path $DefaultUserPath) {
-        try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserRegistryAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null }
-    }
-
-    # Apply to all existing users
-    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-        $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
-        if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
-        try { $UserSID = (New-Object System.Security.Principal.NTAccount($UserProfile.Name)).Translate([System.security.principal.securityidentifier]).value } catch { return }
-        if (Test-Path "Registry::HKEY_USERS\$UserSID") {
-            if (& $UserRegistryAction "HKU:\$UserSID") { $ItemsChanged = $true }
-        } else {
-            try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; if (& $UserRegistryAction "HKU:\TempUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\TempUserHive" | Out-Null }
-        }
-    }
-    if ($ItemsChanged) { Write-Host "    - 'Run' key entries removed."}
+    if($ItemsChanged) { Write-Host "  - Startup entries in user registries have been set to 'Disabled'." }
 
     # --- 2. Disable Scheduled Tasks ---
-    Write-Host "  - Disabling OneDrive-related scheduled tasks..."
-    $Tasks = Get-ScheduledTask | Where-Object { $_.TaskName -like "*OneDrive*" -or $_.Actions.Execute -like "*OneDriveSetup.exe*"}
+    $TaskSearchPattern = ($ExecutableName -split ".exe")[0]
+    $Tasks = Get-ScheduledTask | Where-Object { $_.TaskName -like "*$TaskSearchPattern*" }
     if ($Tasks) {
+        Write-Host "  - Disabling related scheduled tasks..."
         $Tasks | Disable-ScheduledTask -ErrorAction SilentlyContinue
-        if ($?) { $ItemsChanged = $true; Write-Host "    - Disabled $($Tasks.Count) related scheduled task(s)." }
-    } else {
-        Write-Verbose "  - No OneDrive-related scheduled tasks found."
+        if ($?) { $ItemsChanged = $true; Write-Host "    - Disabled $($Tasks.Count) task(s)." }
     }
-    
+
+    # --- 3. App-Specific Policies ---
+    # This section allows for special handling of certain apps.
+    switch ($ExecutableName) {
+        "OneDrive.exe" {
+            # THIS POLICY BLOCKS ONEDRIVE FROM RUNNING ENTIRELY.
+            # ONLY USE THIS IF YOU WANT TO FULLY DISABLE IT, NOT JUST AUTORUN.
+            # We will leave this commented out to prevent the previous issue.
+            # To re-enable, you would uncomment this block.
+            #
+            # Write-Host "  - Applying OneDrive-specific blocking policy..."
+            # $PolicyPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"; $PolicyName = "DisableFileSyncNGSC"
+            # try {
+            #     if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
+            #     Set-ItemProperty -Path $PolicyPath -Name $PolicyName -Value 1 -Type DWord -Force -ErrorAction Stop
+            #     $ItemsChanged = $true
+            #     Write-Host "    - OneDrive usage policy set."
+            # } catch { Write-Warning "  - Failed to set OneDrive blocking policy."}
+        }
+        # Add other special cases here, e.g.:
+        # "Teams.exe" { ... }
+    }
+
     return $ItemsChanged
 }
 ##################################################################################################################
@@ -1125,7 +1118,7 @@ else {
 Write-Host "`n--- Configuring Autostart Programs ---"
 
 # =================================================================================================
-# FINAL INTERACTIVE AUTOSART CONFIGURATION SECTION
+# FINAL INTERACTIVE AUTOSART CONFIGURATION SECTION (using the generic function)
 # =================================================================================================
 
 Write-Host "`n--- Interactive Autostart Configuration ---" -ForegroundColor Yellow
@@ -1133,7 +1126,8 @@ Write-Host "`n--- Interactive Autostart Configuration ---" -ForegroundColor Yell
 # --- Configure Microsoft Edge Autostart ---
 $choiceEdge = Read-Host "Do you want to disable Microsoft Edge from starting automatically? (y/n)"
 if ($choiceEdge -eq 'y') {
-    if (Disable-EdgeAutostart) {
+    # We search for any Run key value that contains "msedge.exe"
+    if (Set-ProgramAutostart -ExecutableName "msedge.exe") {
         Write-Host "Microsoft Edge autostart has been disabled." -ForegroundColor Green
     } else {
         Write-Host "No active Microsoft Edge autostart entries were found to disable."
@@ -1146,7 +1140,8 @@ Write-Output ""
 # --- Configure OneDrive Autostart ---
 $choiceOneDrive = Read-Host "Do you want to disable OneDrive from starting automatically? (y/n)"
 if ($choiceOneDrive -eq 'y') {
-    if (Disable-OneDriveAutostart) {
+    # OneDrive uses a specific, known Run key value named "OneDrive". Targeting it directly is more precise.
+    if (Set-ProgramAutostart -ExecutableName "OneDrive.exe" -RegistryValueName "OneDrive") {
         Write-Host "OneDrive autostart has been disabled." -ForegroundColor Green
     } else {
         Write-Host "No active OneDrive autostart entries were found to disable."
@@ -1155,6 +1150,16 @@ if ($choiceOneDrive -eq 'y') {
     Write-Host "Skipping OneDrive autostart configuration."
 }
 Write-Output ""
+
+# --- Example for Future Use: Microsoft Teams ---
+# $choiceTeams = Read-Host "Do you want to disable Microsoft Teams from starting automatically? (y/n)"
+# if ($choiceTeams -eq 'y') {
+#     if (Set-ProgramAutostart -ExecutableName "Teams.exe") {
+#         Write-Host "Microsoft Teams autostart has been disabled." -ForegroundColor Green
+#     }
+# }
+# Write-Output ""
+
 
 Write-Host "--- Autostart Configuration Finished ---"
 
