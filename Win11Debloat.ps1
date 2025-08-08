@@ -345,67 +345,74 @@ function ReadAppslistFromFile {
 
 #--------------------------
 # =================================================================================================
-# FINAL, RELIABLE RemoveApps FUNCTION (v6) - Direct, Targeted Removal. No Explorer Restart.
-# This version replicates the success of the original script but applies it system-wide.
+# DEFINITIVE RemoveApps FUNCTION - Disables protected apps, Removes normal apps for ALL users
 # =================================================================================================
 function RemoveApps {
+    [CmdletBinding()]
     param (
         [string[]]$AppsList
     )
 
-    Write-Host "> Processing removal for $($AppsList.Count) app(s)/package(s)..." -ForegroundColor Yellow
-
-    # Get a cached dictionary of User SIDs to Usernames for logging
-    $UserSidMap = @{}
-    try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSidMap[$_.SID] = $_.Name } } catch {}
+    Write-Host "> Configuring $($AppsList.Count) app(s)/package(s) system-wide..." -ForegroundColor Yellow
 
     foreach ($AppPattern in $AppsList) {
-        Write-Output "--> Attempting to remove package pattern: $AppPattern"
+        $HandledAsSpecialCase = $false
 
-        # --- Step 1: Remove the Provisioned Package (for all future users) ---
-        # This is a system-wide operation and is correct as is.
-        try {
-            $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
-            if ($ProvisionedPackages) {
-                foreach ($ProvisionedPackage in $ProvisionedPackages) {
-                    Write-Host "  - Removing provisioned package: $($ProvisionedPackage.PackageName)..." -ForegroundColor DarkGray
-                    Remove-AppxProvisionedPackage -Online -PackageName $ProvisionedPackage.PackageName -AllUsers -ErrorAction Stop | Out-Null
-                }
+        # --- SPECIAL HANDLING FOR PROTECTED COMPONENTS via Group Policy ---
+        # This is system-wide (HKLM) or applied to all users (HKCU hives).
+        switch -Wildcard ($AppPattern) {
+            "*Microsoft.Copilot*" {
+                Write-Output "--> Disabling 'Windows Copilot' via Group Policy..."
+                $PolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
+                try {
+                    if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
+                    Set-ItemProperty -Path $PolicyPath -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord -Force -ErrorAction Stop
+                    Write-Host "  - Copilot has been disabled. A restart is required for the icon to disappear."
+                } catch { Write-Warning "  - Failed to set Copilot Group Policy. Error: $($_.Exception.Message)" }
+                $HandledAsSpecialCase = $true
             }
-        } catch { Write-Warning "  - Could not remove provisioned package for '$AppPattern'. Error: $($_.Exception.Message)" }
-
-        # --- Step 2: Remove the App for All Existing Users ---
-        # We will get ALL packages for ALL users that match, then remove them one by one.
-        # This is the most reliable method.
-        try {
-            $AllInstalledPackages = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
-            if ($AllInstalledPackages) {
-                Write-Host "  - Found installed packages for '$AppPattern'. Targeting for removal..." -ForegroundColor DarkGray
-
-                foreach ($Package in $AllInstalledPackages) {
-                    $PackageFullName = $Package.PackageFullName
-                    $UserName = "UnknownUser" # Default username if SID not found
-                    if ($Package.PackageUserInformation) {
-                        $UserName = $UserSidMap[$Package.PackageUserInformation.UserSecurityId.Value]
-                    }
-                    
-                    Write-Host "    - Removing '$PackageFullName' for user: $UserName..."
-                    try {
-                        # The KEY change: We remove the specific package by its full name.
-                        # This is a more direct and reliable command than trying to use -AllUsers during removal.
-                        # It is being run from an Administrator context, which has the authority to remove any user's package.
-                        Remove-AppxPackage -Package $Package.PackageFullName -AllUsers -ErrorAction Stop | Out-Null
-                        Write-Host "      ...Success."
-                    } catch {
-                        Write-Warning "      ...Failed to remove package '$PackageFullName' for user '$UserName'."
-                        Write-Verbose "      Error details: $($_.Exception.Message)"
-                    }
+            "*Microsoft.OutlookForWindows*" {
+                Write-Output "--> Disabling 'New Outlook' toggle via Group Policy for all users..."
+                # This is an HKCU policy, so it must be applied to all user hives.
+                $Action = {
+                    param($HivePath)
+                    $Key = "$($HivePath)\Software\Policies\Microsoft\Office\16.0\Outlook\Options\General"
+                    if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
+                    Set-ItemProperty -Path $Key -Name "HideNewOutlookToggle" -Value 1 -Type DWord -Force
                 }
-            } else {
-                 Write-Verbose "  - No matching installed packages found for pattern '$AppPattern' on any user profile."
+                try {
+                    # Apply to Default User and all existing users
+                    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+                    if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; & $Action "HKU:\DefaultUserHive" } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
+                    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+                        $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"; if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }; try { $UserSID = (New-Object System.Security.Principal.NTAccount($UserProfile.Name)).Translate([System.security.principal.securityidentifier]).value } catch { return }; if (Test-Path "Registry::HKEY_USERS\$UserSID") { & $Action "HKU:\$UserSID" } else { try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; & $Action "HKU:\TempUserHive" } catch {} finally { reg unload "HKU\TempUserHive" | Out-Null } }
+                    }
+                    Write-Host "  - The 'Try the new Outlook' toggle has been disabled for all users."
+                } catch { Write-Warning "  - Failed to disable the new Outlook toggle."}
+                $HandledAsSpecialCase = $true
+            }
+        }
+
+        if ($HandledAsSpecialCase) { continue } # If handled by a special case, move to the next app.
+
+        # --- STANDARD REMOVAL LOGIC FOR REGULAR APPS ---
+        Write-Output "--> Removing standard AppX package: $AppPattern"
+        try {
+            # Step 1: Remove Provisioned Package (ensures FUTURE USERS don't get the app)
+            $Provisioned = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
+            if ($Provisioned) {
+                Write-Host "  - Removing provisioned package to prevent re-install for new users..."
+                $Provisioned | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction SilentlyContinue | Out-Null
+            }
+            
+            # Step 2: Remove for all EXISTING USERS
+            $Installed = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
+            if ($Installed) {
+                Write-Host "  - Removing installed packages from all existing user profiles..."
+                $Installed | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Out-Null
             }
         } catch {
-            Write-Warning "  - An error occurred while finding/removing packages for '$AppPattern'. Error: $($_.Exception.Message)"
+            Write-Warning "  - An error occurred during the removal process for '$AppPattern'."
         }
     }
     Write-Output ""
