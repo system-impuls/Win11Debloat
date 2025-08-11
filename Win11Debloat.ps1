@@ -53,7 +53,8 @@ param (
     [switch]$DesktopIcons,
     [switch]$ShowFrequentList,
     [switch]$StartLayout,
-    [switch]$HiberbootEnabled
+    [switch]$HiberbootEnabled,
+	[switch]$HideNewOutlookToggle
 )
 
 
@@ -1309,7 +1310,7 @@ if ((-not $global:Params.Count) -or $RunDefaults -or $RunWin11Defaults -or $RunS
                 Read-Host | Out-Null
             }
 
-            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled'
+            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle'
 
             PrintHeader 'Default Mode'
 
@@ -1919,6 +1920,10 @@ else {
             RegImport "> Power Hibernation boot Enabled Off..." "Power_Hibernation_boot_Enabled_Off.reg"
             continue
         }
+	'HideNewOutlookToggle' {
+   			RegImport "> Disabling the 'Try the new Outlook' toggle in Classic Outlook for all users..." "Disable_New_Outlook_Toggle.reg"
+   			continue
+		}
         {$_ -in "HideOnedrive", "DisableOnedrive"} {
             RegImport "> Hiding the OneDrive folder from the File Explorer navigation pane..." "Hide_Onedrive_Folder.reg"
             continue
@@ -1931,6 +1936,7 @@ else {
             RegImport "> Hiding the music folder from the File Explorer navigation pane..." "Hide_Music_folder.reg"
             continue
         }
+		
         {$_ -in "HideIncludeInLibrary", "DisableIncludeInLibrary"} {
             RegImport "> Hiding 'Include in library' in the context menu..." "Disable_Include_in_library_from_context_menu.reg"
             continue
