@@ -345,7 +345,7 @@ function ReadAppslistFromFile {
 
 #--------------------------
 # =================================================================================================
-# DEFINITIVE RemoveApps FUNCTION (v2) - With non-hanging provisioned package removal
+# DEFINITIVE RemoveApps FUNCTION (v4) - Correct, non-hanging logic. NO TIMEOUTS.
 # =================================================================================================
 function RemoveApps {
     [CmdletBinding()]
@@ -358,7 +358,7 @@ function RemoveApps {
     foreach ($AppPattern in $AppsList) {
         $HandledAsSpecialCase = $false
 
-        # --- SPECIAL HANDLING for protected apps via policy ---
+        # --- SPECIAL HANDLING FOR PROTECTED COMPONENTS via Group Policy ---
         switch -Wildcard ($AppPattern) {
             "*Microsoft.Copilot*" {
                 Write-Output "--> Disabling 'Windows Copilot' via Group Policy..."
@@ -366,7 +366,7 @@ function RemoveApps {
                 try {
                     if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
                     Set-ItemProperty -Path $PolicyPath -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord -Force -ErrorAction Stop
-                    Write-Host "  - Copilot has been disabled. A restart is required."
+                    Write-Host "  - Copilot has been disabled. A restart is required for the icon to disappear."
                 } catch { Write-Warning "  - Failed to set Copilot Group Policy. Error: $($_.Exception.Message)" }
                 $HandledAsSpecialCase = $true
             }
@@ -381,7 +381,7 @@ function RemoveApps {
                     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
                     if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; & $Action "HKU:\DefaultUserHive" } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
                     Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-                        $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object Net.Security.Principal.NTAccount($up.Name)).Translate([Net.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $Action "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $Action "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
+                        $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $Action "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $Action "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
                     }
                     Write-Host "  - The 'Try the new Outlook' toggle has been disabled for all users."
                 } catch { Write-Warning "  - Failed to disable the new Outlook toggle."}
@@ -394,33 +394,24 @@ function RemoveApps {
         # --- STANDARD REMOVAL LOGIC ---
         Write-Output "--> Removing standard AppX package: $AppPattern"
         try {
-            # Step 1: Remove Provisioned Package (with a timeout to prevent hangs)
-            $Provisioned = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
-            if ($Provisioned) {
-                Write-Host "  - Removing provisioned package to prevent re-install for new users..."
-                # --- THIS IS THE FIX ---
-                # Run the removal as a job with a timeout. 30 seconds is plenty.
-                $Job = Start-Job -ScriptBlock {
-                    param($Packages)
-                    $Packages | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction SilentlyContinue
-                } -ArgumentList (,$Provisioned) # The comma ensures it's treated as an array
-
-                if (Wait-Job -Job $Job -Timeout 30) {
-                    Receive-Job -Job $Job # Clear the job output
-                    Write-Verbose "    - Provisioned package removal job completed."
-                } else {
-                    Write-Warning "    - Provisioned package removal timed out after 30 seconds. The process may be stuck."
-                    # Stop the job to clean up
-                    Stop-Job -Job $Job
+            # Step 1: Remove Provisioned Package (for future users)
+            # This also uses a ForEach-Object loop to avoid pipeline issues.
+            $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
+            if ($ProvisionedPackages) {
+                Write-Host "  - Removing provisioned package(s)..."
+                $ProvisionedPackages | ForEach-Object {
+                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -AllUsers -ErrorAction SilentlyContinue | Out-Null
                 }
-                Remove-Job -Job $Job # Clean up the job object
             }
             
             # Step 2: Remove for all existing users
-            $Installed = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
-            if ($Installed) {
-                Write-Host "  - Removing installed packages from all existing user profiles..."
-                $Installed | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Out-Null
+            # This also uses a ForEach-Object loop to avoid pipeline issues.
+            $InstalledPackages = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
+            if ($InstalledPackages) {
+                Write-Host "  - Removing installed package(s) from all existing user profiles..."
+                $InstalledPackages | ForEach-Object {
+                    Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue | Out-Null
+                }
             }
         } catch {
             Write-Warning "  - An error occurred during the removal process for '$AppPattern'."
