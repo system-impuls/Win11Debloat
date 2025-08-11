@@ -346,8 +346,8 @@ function ReadAppslistFromFile {
 
 #--------------------------
 # =================================================================================================
-# FINAL, COMPLETE RemoveApps FUNCTION - Handles Existing Users, Future Users, and Taskbar
-# Built from the user's proven, working original script.
+# FINAL, DEFINITIVE RemoveApps FUNCTION - Built from the user's original, working script.
+# Prioritizes WINGET for reliability, falls back to the proven PowerShell method.
 # =================================================================================================
 function RemoveApps {
     [CmdletBinding()]
@@ -357,77 +357,71 @@ function RemoveApps {
 
     Write-Host "> Processing removal for $($AppsList.Count) app(s)/package(s) system-wide..." -ForegroundColor Yellow
 
-    # Get a list of all user SIDs on the system once for efficiency
-    $AllUserSIDs = (Get-CimInstance -ClassName Win32_UserAccount -ErrorAction SilentlyContinue).SID
-    if (-not $AllUserSIDs) {
-        Write-Warning "Could not retrieve a list of user accounts. Removal will be limited."
+    # --- Pre-flight check and cache for winget ---
+    $WingetPath = Get-Command winget -ErrorAction SilentlyContinue
+    $WingetListOutput = @()
+    if ($WingetPath) {
+        Write-Host "  - Caching list of installed apps from winget (this may take a moment)..."
+        # We must accept agreements here.
+        $WingetListOutput = winget list --accept-source-agreements
     }
 
     foreach ($AppPattern in $AppsList) {
         Write-Output "--> Attempting to remove package pattern: $AppPattern"
-        $AppWildcard = "*$($AppPattern)*"
+        $AppRemoved = $false
 
-        # --- Step 1: Remove the Provisioned Package (for FUTURE users) ---
-        # This is the crucial step that was missing its own loop.
-        try {
-            $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $AppWildcard }
-            if ($ProvisionedPackages) {
-                Write-Host "  - Removing provisioned package(s) for '$AppPattern'..."
-                $ProvisionedPackages | ForEach-Object {
-                    # This command prevents the app from being installed for any new user account.
-                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -AllUsers -ErrorAction SilentlyContinue | Out-Null
-                }
-            }
-        } catch {
-            Write-Warning "  - An error occurred while trying to remove the provisioned package for '$AppPattern'."
-        }
-
-        # --- Step 2: Remove the App for ALL EXISTING Users ---
-        # This is the logic from your successful script, now applied to every user.
-        if ($AllUserSIDs) {
-            Write-Host "  - Removing installed package(s) for '$AppPattern' from all existing user profiles..."
-            foreach ($UserSID in $AllUserSIDs) {
-                try {
-                    # Get the package specifically for this user
-                    $InstalledPackages = Get-AppxPackage -User $UserSID -Name $AppWildcard -ErrorAction SilentlyContinue
-                    if ($InstalledPackages) {
-                        # Remove each package found for this user
-                        $InstalledPackages | ForEach-Object {
-                            Remove-AppxPackage -Package $_.PackageFullName -User $UserSID -ErrorAction SilentlyContinue | Out-Null
-                        }
+        # --- STRATEGY 1: Attempt removal via WINGET (Primary, most reliable method) ---
+        if ($WingetPath) {
+            try {
+                # Find the app in the cached winget list. We search by name.
+                $WingetEntry = $WingetListOutput | Where-Object { $_ -like "*$AppPattern*" } | Select-Object -First 1
+                if ($WingetEntry) {
+                    # The ID is usually the second element when splitting by whitespace.
+                    $WingetId = ($WingetEntry -split '\s+')[1]
+                    Write-Host "  - Found winget app '$AppPattern' with ID '$WingetId'. Attempting uninstall..." -ForegroundColor Cyan
+                    
+                    $process = Start-Process winget -ArgumentList "uninstall --id $WingetId --accept-source-agreements --disable-interactivity --silent" -Wait -NoNewWindow -PassThru
+                    if ($process.ExitCode -eq 0) {
+                        Write-Host "    - Successfully uninstalled '$AppPattern' via winget."
+                        $AppRemoved = $true
+                    } else {
+                        Write-Warning "    - Winget removal failed with exit code: $($process.ExitCode). Will attempt fallback."
                     }
-                } catch {
-                    # This catch handles errors processing a specific user profile
-                    Write-Verbose "  - Could not process user SID $UserSID. They may not have a full profile."
                 }
+            } catch {
+                Write-Warning "    - An error occurred while trying to use winget for '$AppPattern'."
             }
         }
 
-        # --- Step 3: Unpin from Taskbar (for all EXISTING and FUTURE users) ---
-        # This removes the icon from the taskbar.
-        Write-Host "  - Unpinning '$AppPattern' from all user taskbars..."
-        $UnpinAction = {
-            param($UserHivePath)
-            $TaskbandPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
-            if (Test-Path $TaskbandPath) {
-                try {
-                    $CurrentPins = Get-ItemPropertyValue -Path $TaskbandPath -Name "Favorites" -ErrorAction SilentlyContinue
-                    if ($CurrentPins) {
-                        $PinsAsString = [System.Text.Encoding]::Unicode.GetString($CurrentPins)
-                        if ($PinsAsString -like "*$($using:AppPattern)*") {
-                            # Aggressive but reliable: clear all pins if a bloatware app is found.
-                            Remove-ItemProperty -Path $TaskbandPath -Name "Favorites" -Force -ErrorAction SilentlyContinue
-                            Write-Host "    - Cleared Taskbar pins for a user profile to remove '$AppPattern'."
-                        }
-                    }
-                } catch {}
+        # --- STRATEGY 2: Fallback to your original, proven PowerShell method ---
+        if (-not $AppRemoved) {
+            if ($WingetPath) { Write-Host "  - Winget method failed or app not found. Falling back to PowerShell AppX method..." }
+            else { Write-Host "  - Winget not found. Using PowerShell AppX method..." }
+            
+            $AppWildcard = "*$AppPattern*"
+
+            try {
+                # 1. Remove Provisioned Package (for future users) - Your original logic
+                $Provisioned = Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $AppWildcard }
+                if ($Provisioned) {
+                    $Provisioned | ForEach-Object { Remove-AppxProvisionedPackage -Online -AllUsers -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null }
+                }
+
+                # 2. Remove Installed Package - Your original logic
+                $Installed = Get-AppxPackage -Name $AppWildcard -AllUsers
+                if ($Installed) {
+                    $Installed | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Out-Null
+                }
+                
+                # Verify removal
+                if (-not (Get-AppxPackage -Name $AppWildcard -AllUsers)) {
+                    Write-Host "    - Successfully uninstalled '$AppPattern' via PowerShell."
+                } else {
+                     Write-Warning "    - PowerShell method failed to remove '$AppPattern'. The package may be protected or in use."
+                }
+            } catch {
+                Write-Warning "    - A critical error occurred during PowerShell removal for '$AppPattern'."
             }
-        }
-        # Apply this unpinning action to all users and the default profile
-        $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-        if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; & $UnpinAction "HKU:\DefaultUserHive" } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
-        Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-            $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User")-or!(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $UnpinAction "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $UnpinAction "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
         }
     }
     Write-Output ""
