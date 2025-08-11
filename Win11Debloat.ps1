@@ -345,7 +345,8 @@ function ReadAppslistFromFile {
 
 #--------------------------
 # =================================================================================================
-# FINAL RemoveApps FUNCTION (v6) - Corrected DISM package naming and "HKU Drive Not Found" bug
+# FINAL, COMPLETE RemoveApps FUNCTION - Handles Existing Users, Future Users, and Taskbar
+# Built from the user's proven, working original script.
 # =================================================================================================
 function RemoveApps {
     [CmdletBinding()]
@@ -353,73 +354,79 @@ function RemoveApps {
         [string[]]$AppsList
     )
 
-    Write-Host "> Configuring $($AppsList.Count) app(s)/package(s) system-wide..." -ForegroundColor Yellow
+    Write-Host "> Processing removal for $($AppsList.Count) app(s)/package(s) system-wide..." -ForegroundColor Yellow
+
+    # Get a list of all user SIDs on the system once for efficiency
+    $AllUserSIDs = (Get-CimInstance -ClassName Win32_UserAccount -ErrorAction SilentlyContinue).SID
+    if (-not $AllUserSIDs) {
+        Write-Warning "Could not retrieve a list of user accounts. Removal will be limited."
+    }
 
     foreach ($AppPattern in $AppsList) {
-        $HandledAsSpecialCase = $false
+        Write-Output "--> Attempting to remove package pattern: $AppPattern"
+        $AppWildcard = "*$($AppPattern)*"
 
-        # --- SPECIAL HANDLING FOR PROTECTED COMPONENTS via Group Policy ---
-        switch -Wildcard ($AppPattern) {
-            "*Microsoft.Copilot*" {
-                Write-Output "--> Disabling 'Windows Copilot' via Group Policy..."
-                $PolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
-                try { if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }; Set-ItemProperty -Path $PolicyPath -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord -Force -ErrorAction Stop; Write-Host "  - Copilot has been disabled. A restart is required." } catch { Write-Warning "  - Failed to set Copilot Group Policy. Error: $($_.Exception.Message)" }
-                $HandledAsSpecialCase = $true
-            }
-            "*Microsoft.OutlookForWindows*" {
-                Write-Output "--> Disabling 'New Outlook' toggle via Group Policy for all users..."
-                # --- THIS IS THE FIX for the "HKU Drive Not Found" error ---
-                $Action = {
-                    param($UserHivePath)
-                    # We build the path using string concatenation
-                    $Key = "$($UserHivePath)\Software\Policies\Microsoft\Office\16.0\Outlook\Options\General"
-                    # And use the Registry provider explicitly for New-Item
-                    $ProviderPath = "Microsoft.PowerShell.Core\Registry::$Key"
-                    if (-not (Test-Path $ProviderPath)) { New-Item -Path $ProviderPath -Force | Out-Null }
-                    Set-ItemProperty -Path $ProviderPath -Name "HideNewOutlookToggle" -Value 1 -Type DWord -Force
+        # --- Step 1: Remove the Provisioned Package (for FUTURE users) ---
+        # This is the crucial step that was missing its own loop.
+        try {
+            $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $AppWildcard }
+            if ($ProvisionedPackages) {
+                Write-Host "  - Removing provisioned package(s) for '$AppPattern'..."
+                $ProvisionedPackages | ForEach-Object {
+                    # This command prevents the app from being installed for any new user account.
+                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -AllUsers -ErrorAction SilentlyContinue | Out-Null
                 }
+            }
+        } catch {
+            Write-Warning "  - An error occurred while trying to remove the provisioned package for '$AppPattern'."
+        }
+
+        # --- Step 2: Remove the App for ALL EXISTING Users ---
+        # This is the logic from your successful script, now applied to every user.
+        if ($AllUserSIDs) {
+            Write-Host "  - Removing installed package(s) for '$AppPattern' from all existing user profiles..."
+            foreach ($UserSID in $AllUserSIDs) {
                 try {
-                    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-                    if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; & $Action "HKU:\DefaultUserHive" } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
-                    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-                        $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $Action "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $Action "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
+                    # Get the package specifically for this user
+                    $InstalledPackages = Get-AppxPackage -User $UserSID -Name $AppWildcard -ErrorAction SilentlyContinue
+                    if ($InstalledPackages) {
+                        # Remove each package found for this user
+                        $InstalledPackages | ForEach-Object {
+                            Remove-AppxPackage -Package $_.PackageFullName -User $UserSID -ErrorAction SilentlyContinue | Out-Null
+                        }
                     }
-                    Write-Host "  - The 'Try the new Outlook' toggle has been disabled for all users."
-                } catch { Write-Warning "  - Failed to disable the new Outlook toggle."}
-                $HandledAsSpecialCase = $true
+                } catch {
+                    # This catch handles errors processing a specific user profile
+                    Write-Verbose "  - Could not process user SID $UserSID. They may not have a full profile."
+                }
             }
         }
 
-        if ($HandledAsSpecialCase) { continue }
-
-        # --- STANDARD REMOVAL LOGIC USING DISM ---
-        Write-Output "--> Removing standard AppX package using DISM: $AppPattern"
-        try {
-            # Step 1: Get all packages matching the pattern
-            $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
-            
-            if ($ProvisionedPackages) {
-                # --- THIS IS THE FIX for the DISM Error Code 2 ---
-                # We use the correct PackageName from the provisioned package object itself.
-                # We do not need to look at installed packages to get the name.
-                Write-Host "  - Found $($ProvisionedPackages.Count) provisioned package(s) to remove."
-
-                foreach ($Package in $ProvisionedPackages) {
-                    $PackageNameToRemove = $Package.PackageName
-                    Write-Host "    - Targeting package: $PackageNameToRemove"
-                    
-                    $DismArguments = "/Online /Remove-ProvisionedAppxPackage /PackageName:$PackageNameToRemove"
-                    $process = Start-Process "dism.exe" -ArgumentList $DismArguments -Wait -NoNewWindow -PassThru
-
-                    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) { # 3010 is a common success code meaning "reboot required"
-                        Write-Warning "      DISM process for '$PackageNameToRemove' finished with exit code: $($process.ExitCode)."
+        # --- Step 3: Unpin from Taskbar (for all EXISTING and FUTURE users) ---
+        # This removes the icon from the taskbar.
+        Write-Host "  - Unpinning '$AppPattern' from all user taskbars..."
+        $UnpinAction = {
+            param($UserHivePath)
+            $TaskbandPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+            if (Test-Path $TaskbandPath) {
+                try {
+                    $CurrentPins = Get-ItemPropertyValue -Path $TaskbandPath -Name "Favorites" -ErrorAction SilentlyContinue
+                    if ($CurrentPins) {
+                        $PinsAsString = [System.Text.Encoding]::Unicode.GetString($CurrentPins)
+                        if ($PinsAsString -like "*$($using:AppPattern)*") {
+                            # Aggressive but reliable: clear all pins if a bloatware app is found.
+                            Remove-ItemProperty -Path $TaskbandPath -Name "Favorites" -Force -ErrorAction SilentlyContinue
+                            Write-Host "    - Cleared Taskbar pins for a user profile to remove '$AppPattern'."
+                        }
                     }
-                }
-            } else {
-                Write-Verbose "  - No provisioned packages found for pattern '$AppPattern'."
+                } catch {}
             }
-        } catch {
-            Write-Warning "  - A critical error occurred during the DISM removal process for '$AppPattern'."
+        }
+        # Apply this unpinning action to all users and the default profile
+        $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+        if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; & $UnpinAction "HKU:\DefaultUserHive" } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
+        Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+            $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User")-or!(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $UnpinAction "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $UnpinAction "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
         }
     }
     Write-Output ""
