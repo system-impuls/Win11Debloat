@@ -345,7 +345,7 @@ function ReadAppslistFromFile {
 
 #--------------------------
 # =================================================================================================
-# DEFINITIVE RemoveApps FUNCTION (v4) - Correct, non-hanging logic. NO TIMEOUTS.
+# FINAL RemoveApps FUNCTION (v5) - Uses DISM for removal to bypass PowerShell hangs
 # =================================================================================================
 function RemoveApps {
     [CmdletBinding()]
@@ -366,11 +366,12 @@ function RemoveApps {
                 try {
                     if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
                     Set-ItemProperty -Path $PolicyPath -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord -Force -ErrorAction Stop
-                    Write-Host "  - Copilot has been disabled. A restart is required for the icon to disappear."
+                    Write-Host "  - Copilot has been disabled. A restart is required."
                 } catch { Write-Warning "  - Failed to set Copilot Group Policy. Error: $($_.Exception.Message)" }
                 $HandledAsSpecialCase = $true
             }
             "*Microsoft.OutlookForWindows*" {
+                # This logic is complex and confirmed working, so we keep it.
                 Write-Output "--> Disabling 'New Outlook' toggle via Group Policy for all users..."
                 $Action = { param($HivePath)
                     $Key = "$($HivePath)\Software\Policies\Microsoft\Office\16.0\Outlook\Options\General"
@@ -383,7 +384,6 @@ function RemoveApps {
                     Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
                         $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $Action "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $Action "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
                     }
-                    Write-Host "  - The 'Try the new Outlook' toggle has been disabled for all users."
                 } catch { Write-Warning "  - Failed to disable the new Outlook toggle."}
                 $HandledAsSpecialCase = $true
             }
@@ -391,30 +391,39 @@ function RemoveApps {
 
         if ($HandledAsSpecialCase) { continue }
 
-        # --- STANDARD REMOVAL LOGIC ---
-        Write-Output "--> Removing standard AppX package: $AppPattern"
+        # --- STANDARD REMOVAL LOGIC USING DISM ---
+        Write-Output "--> Removing standard AppX package using DISM: $AppPattern"
         try {
-            # Step 1: Remove Provisioned Package (for future users)
-            # This also uses a ForEach-Object loop to avoid pipeline issues.
+            # Step 1: Get all packages matching the pattern (both provisioned and installed)
+            $AllPackages = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
             $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
-            if ($ProvisionedPackages) {
-                Write-Host "  - Removing provisioned package(s)..."
-                $ProvisionedPackages | ForEach-Object {
-                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -AllUsers -ErrorAction SilentlyContinue | Out-Null
+
+            if ($AllPackages -or $ProvisionedPackages) {
+                # Create a unique list of PackageFullNames to remove
+                $PackageNamesToRemove = @()
+                if ($AllPackages) { $PackageNamesToRemove += $AllPackages.PackageFullName }
+                if ($ProvisionedPackages) { $PackageNamesToRemove += $ProvisionedPackages.PackageName }
+                $UniquePackageNames = $PackageNamesToRemove | Sort-Object -Unique
+
+                Write-Host "  - Found $($UniquePackageNames.Count) unique package(s) to remove."
+
+                foreach ($PackageName in $UniquePackageNames) {
+                    Write-Host "    - Targeting package: $PackageName"
+                    # We use Start-Process to call DISM.exe directly. This is a very low-level and robust method.
+                    # It avoids the PowerShell cmdlets that are hanging.
+                    $DismArguments = "/Online /Remove-ProvisionedAppxPackage /PackageName:$PackageName"
+                    $process = Start-Process "dism.exe" -ArgumentList $DismArguments -Wait -NoNewWindow -PassThru
+
+                    if ($process.ExitCode -ne 0) {
+                        # If removal fails (e.g., exit code 3010 means a reboot is required), log it.
+                        Write-Warning "      DISM process for '$PackageName' finished with a non-zero exit code: $($process.ExitCode). A reboot may be required."
+                    }
                 }
-            }
-            
-            # Step 2: Remove for all existing users
-            # This also uses a ForEach-Object loop to avoid pipeline issues.
-            $InstalledPackages = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
-            if ($InstalledPackages) {
-                Write-Host "  - Removing installed package(s) from all existing user profiles..."
-                $InstalledPackages | ForEach-Object {
-                    Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue | Out-Null
-                }
+            } else {
+                Write-Verbose "  - No installed or provisioned packages found for pattern '$AppPattern'."
             }
         } catch {
-            Write-Warning "  - An error occurred during the removal process for '$AppPattern'."
+            Write-Warning "  - A critical error occurred during the DISM removal process for '$AppPattern'."
         }
     }
     Write-Output ""
