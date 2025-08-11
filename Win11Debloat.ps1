@@ -878,9 +878,9 @@ function Set-WindowsNtpServer {
     return $OverallSuccess
 }
 
+
 # =================================================================================================
-# DEFINITIVE GENERIC Set-ProgramAutostart FUNCTION
-# Correctly disables startup for any app by targeting StartupApproved keys for all users.
+# DEFINITIVE GENERIC Set-ProgramAutostart FUNCTION (v2 - CORRECTED 'using:' scope bug)
 # =================================================================================================
 function Set-ProgramAutostart {
     [CmdletBinding()]
@@ -897,7 +897,6 @@ function Set-ProgramAutostart {
     $ItemsChanged = $false
 
     # --- 1. Disable from Registry Run Key (for all users) using StartupApproved ---
-    # This is the modern, correct method that mirrors Task Manager's "Disable" button.
     $UserDisableAction = {
         param($UserHivePath)
         $ActionTaken = $false
@@ -906,11 +905,11 @@ function Set-ProgramAutostart {
         $DisabledValue = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
 
         # If a specific registry value name is provided (like "OneDrive"), target it directly.
-        if ($using:RegistryValueName) {
-            if (Get-ItemProperty -Path $RunKeyPath -Name $using:RegistryValueName -ErrorAction SilentlyContinue) {
+        if ($RegistryValueName) {
+            if (Get-ItemProperty -Path $RunKeyPath -Name $RegistryValueName -ErrorAction SilentlyContinue) {
                 try {
                     if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
-                    Set-ItemProperty -Path $StartupApprovedPath -Name $using:RegistryValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
+                    Set-ItemProperty -Path $StartupApprovedPath -Name $RegistryValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
                     $ActionTaken = $true
                 } catch {}
             }
@@ -919,8 +918,9 @@ function Set-ProgramAutostart {
         else {
             $Properties = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
             if ($null -ne $Properties) {
+                # --- THIS IS THE FIX: Removed the invalid '$using:' scope modifier ---
                 $Properties.PSObject.Properties | ForEach-Object {
-                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($using:ExecutableName.ToLower())) {
+                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($ExecutableName.ToLower())) {
                         $CurrentValueName = $_.Name
                         try {
                             if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
@@ -951,30 +951,17 @@ function Set-ProgramAutostart {
         if ($?) { $ItemsChanged = $true; Write-Host "    - Disabled $($Tasks.Count) task(s)." }
     }
 
-    # --- 3. App-Specific Policies ---
-    # This section allows for special handling of certain apps.
+    # --- 3. App-Specific Policies (Safely Commented Out) ---
     switch ($ExecutableName) {
         "OneDrive.exe" {
-            # THIS POLICY BLOCKS ONEDRIVE FROM RUNNING ENTIRELY.
-            # ONLY USE THIS IF YOU WANT TO FULLY DISABLE IT, NOT JUST AUTORUN.
-            # We will leave this commented out to prevent the previous issue.
-            # To re-enable, you would uncomment this block.
-            #
-            # Write-Host "  - Applying OneDrive-specific blocking policy..."
-            # $PolicyPath = "HKLM:\Software\Policies\Microsoft\Windows\OneDrive"; $PolicyName = "DisableFileSyncNGSC"
-            # try {
-            #     if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
-            #     Set-ItemProperty -Path $PolicyPath -Name $PolicyName -Value 1 -Type DWord -Force -ErrorAction Stop
-            #     $ItemsChanged = $true
-            #     Write-Host "    - OneDrive usage policy set."
-            # } catch { Write-Warning "  - Failed to set OneDrive blocking policy."}
+            # This policy blocks OneDrive from running entirely. It is intentionally left
+            # commented out to prevent breaking OneDrive for users who want to use it manually.
         }
-        # Add other special cases here, e.g.:
-        # "Teams.exe" { ... }
     }
 
     return $ItemsChanged
 }
+
 ##################################################################################################################
 #                                                                                                                #
 #                                                  SCRIPT START                                                  #
