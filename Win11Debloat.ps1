@@ -345,7 +345,7 @@ function ReadAppslistFromFile {
 
 #--------------------------
 # =================================================================================================
-# FINAL RemoveApps FUNCTION (v5) - Uses DISM for removal to bypass PowerShell hangs
+# FINAL RemoveApps FUNCTION (v6) - Corrected DISM package naming and "HKU Drive Not Found" bug
 # =================================================================================================
 function RemoveApps {
     [CmdletBinding()]
@@ -363,20 +363,20 @@ function RemoveApps {
             "*Microsoft.Copilot*" {
                 Write-Output "--> Disabling 'Windows Copilot' via Group Policy..."
                 $PolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
-                try {
-                    if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
-                    Set-ItemProperty -Path $PolicyPath -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord -Force -ErrorAction Stop
-                    Write-Host "  - Copilot has been disabled. A restart is required."
-                } catch { Write-Warning "  - Failed to set Copilot Group Policy. Error: $($_.Exception.Message)" }
+                try { if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }; Set-ItemProperty -Path $PolicyPath -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord -Force -ErrorAction Stop; Write-Host "  - Copilot has been disabled. A restart is required." } catch { Write-Warning "  - Failed to set Copilot Group Policy. Error: $($_.Exception.Message)" }
                 $HandledAsSpecialCase = $true
             }
             "*Microsoft.OutlookForWindows*" {
-                # This logic is complex and confirmed working, so we keep it.
                 Write-Output "--> Disabling 'New Outlook' toggle via Group Policy for all users..."
-                $Action = { param($HivePath)
-                    $Key = "$($HivePath)\Software\Policies\Microsoft\Office\16.0\Outlook\Options\General"
-                    if (-not (Test-Path $Key)) { New-Item -Path $Key -Force | Out-Null }
-                    Set-ItemProperty -Path $Key -Name "HideNewOutlookToggle" -Value 1 -Type DWord -Force
+                # --- THIS IS THE FIX for the "HKU Drive Not Found" error ---
+                $Action = {
+                    param($UserHivePath)
+                    # We build the path using string concatenation
+                    $Key = "$($UserHivePath)\Software\Policies\Microsoft\Office\16.0\Outlook\Options\General"
+                    # And use the Registry provider explicitly for New-Item
+                    $ProviderPath = "Microsoft.PowerShell.Core\Registry::$Key"
+                    if (-not (Test-Path $ProviderPath)) { New-Item -Path $ProviderPath -Force | Out-Null }
+                    Set-ItemProperty -Path $ProviderPath -Name "HideNewOutlookToggle" -Value 1 -Type DWord -Force
                 }
                 try {
                     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
@@ -384,6 +384,7 @@ function RemoveApps {
                     Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
                         $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){& $Action "HKU:\$sid"}else{try{reg load "HKU\TempUserHive" $nud|Out-Null;& $Action "HKU:\TempUserHive"}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
                     }
+                    Write-Host "  - The 'Try the new Outlook' toggle has been disabled for all users."
                 } catch { Write-Warning "  - Failed to disable the new Outlook toggle."}
                 $HandledAsSpecialCase = $true
             }
@@ -394,33 +395,28 @@ function RemoveApps {
         # --- STANDARD REMOVAL LOGIC USING DISM ---
         Write-Output "--> Removing standard AppX package using DISM: $AppPattern"
         try {
-            # Step 1: Get all packages matching the pattern (both provisioned and installed)
-            $AllPackages = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
+            # Step 1: Get all packages matching the pattern
             $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
+            
+            if ($ProvisionedPackages) {
+                # --- THIS IS THE FIX for the DISM Error Code 2 ---
+                # We use the correct PackageName from the provisioned package object itself.
+                # We do not need to look at installed packages to get the name.
+                Write-Host "  - Found $($ProvisionedPackages.Count) provisioned package(s) to remove."
 
-            if ($AllPackages -or $ProvisionedPackages) {
-                # Create a unique list of PackageFullNames to remove
-                $PackageNamesToRemove = @()
-                if ($AllPackages) { $PackageNamesToRemove += $AllPackages.PackageFullName }
-                if ($ProvisionedPackages) { $PackageNamesToRemove += $ProvisionedPackages.PackageName }
-                $UniquePackageNames = $PackageNamesToRemove | Sort-Object -Unique
-
-                Write-Host "  - Found $($UniquePackageNames.Count) unique package(s) to remove."
-
-                foreach ($PackageName in $UniquePackageNames) {
-                    Write-Host "    - Targeting package: $PackageName"
-                    # We use Start-Process to call DISM.exe directly. This is a very low-level and robust method.
-                    # It avoids the PowerShell cmdlets that are hanging.
-                    $DismArguments = "/Online /Remove-ProvisionedAppxPackage /PackageName:$PackageName"
+                foreach ($Package in $ProvisionedPackages) {
+                    $PackageNameToRemove = $Package.PackageName
+                    Write-Host "    - Targeting package: $PackageNameToRemove"
+                    
+                    $DismArguments = "/Online /Remove-ProvisionedAppxPackage /PackageName:$PackageNameToRemove"
                     $process = Start-Process "dism.exe" -ArgumentList $DismArguments -Wait -NoNewWindow -PassThru
 
-                    if ($process.ExitCode -ne 0) {
-                        # If removal fails (e.g., exit code 3010 means a reboot is required), log it.
-                        Write-Warning "      DISM process for '$PackageName' finished with a non-zero exit code: $($process.ExitCode). A reboot may be required."
+                    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) { # 3010 is a common success code meaning "reboot required"
+                        Write-Warning "      DISM process for '$PackageNameToRemove' finished with exit code: $($process.ExitCode)."
                     }
                 }
             } else {
-                Write-Verbose "  - No installed or provisioned packages found for pattern '$AppPattern'."
+                Write-Verbose "  - No provisioned packages found for pattern '$AppPattern'."
             }
         } catch {
             Write-Warning "  - A critical error occurred during the DISM removal process for '$AppPattern'."
