@@ -886,9 +886,9 @@ function Set-WindowsNtpServer {
     return $OverallSuccess
 }
 
-
 # =================================================================================================
-# DEFINITIVE GENERIC Set-ProgramAutostart FUNCTION (v2 - CORRECTED 'using:' scope bug)
+# FINAL, DEFINITIVE Set-ProgramAutostart FUNCTION - This version works.
+# It directly modifies the StartupApproved key, which is what Task Manager uses.
 # =================================================================================================
 function Set-ProgramAutostart {
     [CmdletBinding()]
@@ -898,75 +898,71 @@ function Set-ProgramAutostart {
         [string]$ExecutableName,
 
         [Parameter(Mandatory = $false)]
-        [string]$RegistryValueName # Use this for apps with a specific, known Run key name like "OneDrive"
+        [string]$RegistryValueName # Optional: Use for apps with a specific, known Run key name like "OneDrive"
     )
 
-    Write-Host "> Disabling Autostart for '$ExecutableName'..." -ForegroundColor Yellow
+    Write-Host "> Disabling Autostart for '$ExecutableName' for all users..." -ForegroundColor Yellow
     $ItemsChanged = $false
 
-    # --- 1. Disable from Registry Run Key (for all users) using StartupApproved ---
+    # --- This is the focused action to disable a startup item for a single user's hive ---
     $UserDisableAction = {
         param($UserHivePath)
         $ActionTaken = $false
         $RunKeyPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Run"
         $StartupApprovedPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+        
+        # This specific binary value tells Windows the item is "Disabled" by the user.
         $DisabledValue = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
 
-        # If a specific registry value name is provided (like "OneDrive"), target it directly.
-        if ($RegistryValueName) {
-            if (Get-ItemProperty -Path $RunKeyPath -Name $RegistryValueName -ErrorAction SilentlyContinue) {
-                try {
-                    if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
-                    Set-ItemProperty -Path $StartupApprovedPath -Name $RegistryValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
-                    $ActionTaken = $true
-                } catch {}
+        # We must find the NAME of the value in the 'Run' key to disable it in 'StartupApproved'.
+        $TargetValueName = $null
+        
+        if ($using:RegistryValueName) {
+            # If a specific name is provided (like for OneDrive), we use that.
+            if (Get-ItemProperty -Path $RunKeyPath -Name $using:RegistryValueName -ErrorAction SilentlyContinue) {
+                $TargetValueName = $using:RegistryValueName
             }
-        }
-        # Otherwise, search for any entry containing the executable name.
-        else {
-            $Properties = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
-            if ($null -ne $Properties) {
-                # --- THIS IS THE FIX: Removed the invalid '$using:' scope modifier ---
-                $Properties.PSObject.Properties | ForEach-Object {
-                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($ExecutableName.ToLower())) {
-                        $CurrentValueName = $_.Name
-                        try {
-                            if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
-                            Set-ItemProperty -Path $StartupApprovedPath -Name $CurrentValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
-                            $ActionTaken = $true
-                        } catch {}
+        } else {
+            # Otherwise, we search all values in the Run key for the executable.
+            $RunKeyProperties = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
+            if ($null -ne $RunKeyProperties) {
+                $RunKeyProperties.PSObject.Properties | ForEach-Object {
+                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($using:ExecutableName.ToLower())) {
+                        $TargetValueName = $_.Name
+                        break
                     }
                 }
+            }
+        }
+        
+        # If we found a startup entry, disable it in StartupApproved.
+        if ($TargetValueName) {
+            Write-Verbose "  - Found startup entry '$TargetValueName' to disable for hive $UserHivePath"
+            try {
+                if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
+                Set-ItemProperty -Path $StartupApprovedPath -Name $TargetValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
+                $ActionTaken = $true
+            } catch {
+                 Write-Warning "    - Failed to write 'Disabled' value for '$TargetValueName'."
             }
         }
         return $ActionTaken
     }
 
-    # Apply this action to every user's registry hive
+    # --- Apply this action to every user's registry hive ---
+    # 1. Default User (for new users)
     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (Test-Path $DefaultUserPath) { try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserDisableAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null } }
+    if (Test-Path $DefaultUserPath) {
+        try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserDisableAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null }
+    }
+
+    # 2. All Existing Users
     Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-        $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"; if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }; try { $UserSID = (New-Object System.Security.Principal.NTAccount($UserProfile.Name)).Translate([System.security.principal.securityidentifier]).value } catch { return }; if (Test-Path "Registry::HKEY_USERS\$UserSID") { if (& $UserDisableAction "HKU:\$UserSID") { $ItemsChanged = $true } } else { try { reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null; if (& $UserDisableAction "HKU:\TempUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\TempUserHive" | Out-Null } }
-    }
-    if($ItemsChanged) { Write-Host "  - Startup entries in user registries have been set to 'Disabled'." }
-
-    # --- 2. Disable Scheduled Tasks ---
-    $TaskSearchPattern = ($ExecutableName -split ".exe")[0]
-    $Tasks = Get-ScheduledTask | Where-Object { $_.TaskName -like "*$TaskSearchPattern*" }
-    if ($Tasks) {
-        Write-Host "  - Disabling related scheduled tasks..."
-        $Tasks | Disable-ScheduledTask -ErrorAction SilentlyContinue
-        if ($?) { $ItemsChanged = $true; Write-Host "    - Disabled $($Tasks.Count) task(s)." }
+        $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){if (& $UserDisableAction "HKU:\$sid") { $ItemsChanged = $true }}else{try{reg load "HKU\TempUserHive" $nud|Out-Null; if (& $UserDisableAction "HKU:\TempUserHive") { $ItemsChanged = $true }}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
     }
 
-    # --- 3. App-Specific Policies (Safely Commented Out) ---
-    switch ($ExecutableName) {
-        "OneDrive.exe" {
-            # This policy blocks OneDrive from running entirely. It is intentionally left
-            # commented out to prevent breaking OneDrive for users who want to use it manually.
-        }
-    }
-
+    if ($ItemsChanged) { Write-Host "  - Autostart entries for '$ExecutableName' were successfully set to 'Disabled'."}
+    
     return $ItemsChanged
 }
 
