@@ -887,7 +887,7 @@ function Set-WindowsNtpServer {
 }
 
 # =================================================================================================
-# FINAL, DEFINITIVE Set-ProgramAutostart FUNCTION - This version works.
+# FINAL, DEFINITIVE Set-ProgramAutostart FUNCTION (v2 - CORRECTED CRASHING BUG)
 # It directly modifies the StartupApproved key, which is what Task Manager uses.
 # =================================================================================================
 function Set-ProgramAutostart {
@@ -911,23 +911,21 @@ function Set-ProgramAutostart {
         $RunKeyPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Run"
         $StartupApprovedPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
         
-        # This specific binary value tells Windows the item is "Disabled" by the user.
         $DisabledValue = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
-
-        # We must find the NAME of the value in the 'Run' key to disable it in 'StartupApproved'.
         $TargetValueName = $null
         
-        if ($using:RegistryValueName) {
+        if ($RegistryValueName) {
             # If a specific name is provided (like for OneDrive), we use that.
-            if (Get-ItemProperty -Path $RunKeyPath -Name $using:RegistryValueName -ErrorAction SilentlyContinue) {
-                $TargetValueName = $using:RegistryValueName
+            if (Get-ItemProperty -Path $RunKeyPath -Name $RegistryValueName -ErrorAction SilentlyContinue) {
+                $TargetValueName = $RegistryValueName
             }
         } else {
             # Otherwise, we search all values in the Run key for the executable.
             $RunKeyProperties = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
             if ($null -ne $RunKeyProperties) {
+                # --- THIS IS THE FIX: Removed the invalid '$using:' scope modifier ---
                 $RunKeyProperties.PSObject.Properties | ForEach-Object {
-                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($using:ExecutableName.ToLower())) {
+                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($ExecutableName.ToLower())) {
                         $TargetValueName = $_.Name
                         break
                     }
@@ -935,7 +933,6 @@ function Set-ProgramAutostart {
             }
         }
         
-        # If we found a startup entry, disable it in StartupApproved.
         if ($TargetValueName) {
             Write-Verbose "  - Found startup entry '$TargetValueName' to disable for hive $UserHivePath"
             try {
@@ -950,13 +947,10 @@ function Set-ProgramAutostart {
     }
 
     # --- Apply this action to every user's registry hive ---
-    # 1. Default User (for new users)
     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
     if (Test-Path $DefaultUserPath) {
         try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserDisableAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null }
     }
-
-    # 2. All Existing Users
     Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
         $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){if (& $UserDisableAction "HKU:\$sid") { $ItemsChanged = $true }}else{try{reg load "HKU\TempUserHive" $nud|Out-Null; if (& $UserDisableAction "HKU:\TempUserHive") { $ItemsChanged = $true }}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
     }
@@ -965,7 +959,6 @@ function Set-ProgramAutostart {
     
     return $ItemsChanged
 }
-
 ##################################################################################################################
 #                                                                                                                #
 #                                                  SCRIPT START                                                  #
