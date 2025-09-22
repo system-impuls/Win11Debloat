@@ -54,7 +54,8 @@ param (
     [switch]$ShowFrequentList,
     [switch]$StartLayout,
     [switch]$HiberbootEnabled,
-	[switch]$HideNewOutlookToggle
+	[switch]$HideNewOutlookToggle,
+ 	[switch]$HighPerformance
 )
 
 
@@ -345,86 +346,44 @@ function ReadAppslistFromFile {
 
 
 #--------------------------
-# =================================================================================================
-# FINAL, DEFINITIVE RemoveApps FUNCTION - Built from the user's original, working script.
-# Prioritizes WINGET for reliability, falls back to the proven PowerShell method.
-# =================================================================================================
 function RemoveApps {
     [CmdletBinding()]
-    param (
-        [string[]]$AppsList
-    )
+    param ([string[]]$AppsList)
 
-    Write-Host "> Processing removal for $($AppsList.Count) app(s)/package(s) system-wide..." -ForegroundColor Yellow
-
-    # --- Pre-flight check and cache for winget ---
+    Write-Host "> Configuring $($AppsList.Count) app(s)/package(s) system-wide..." -ForegroundColor Yellow
     $WingetPath = Get-Command winget -ErrorAction SilentlyContinue
-    $WingetListOutput = @()
-    if ($WingetPath) {
-        Write-Host "  - Caching list of installed apps from winget (this may take a moment)..."
-        # We must accept agreements here.
-        $WingetListOutput = winget list --accept-source-agreements
-    }
 
     foreach ($AppPattern in $AppsList) {
-        Write-Output "--> Attempting to remove package pattern: $AppPattern"
-        $AppRemoved = $false
+        # --- Handle special cases first ---
+        # ... (Your existing switch block for Copilot and Outlook Toggle goes here) ...
 
-        # --- STRATEGY 1: Attempt removal via WINGET (Primary, most reliable method) ---
-        if ($WingetPath) {
-            try {
-                # Find the app in the cached winget list. We search by name.
-                $WingetEntry = $WingetListOutput | Where-Object { $_ -like "*$AppPattern*" } | Select-Object -First 1
-                if ($WingetEntry) {
-                    # The ID is usually the second element when splitting by whitespace.
-                    $WingetId = ($WingetEntry -split '\s+')[1]
-                    Write-Host "  - Found winget app '$AppPattern' with ID '$WingetId'. Attempting uninstall..." -ForegroundColor Cyan
-                    
-                    $process = Start-Process winget -ArgumentList "uninstall --id $WingetId --accept-source-agreements --disable-interactivity --silent" -Wait -NoNewWindow -PassThru
-                    if ($process.ExitCode -eq 0) {
-                        Write-Host "    - Successfully uninstalled '$AppPattern' via winget."
-                        $AppRemoved = $true
-                    } else {
-                        Write-Warning "    - Winget removal failed with exit code: $($process.ExitCode). Will attempt fallback."
-                    }
+        # --- Universal Removal Logic ---
+        Write-Output "--> Removing package: $AppPattern"
+        try {
+            # Step 1: Remove Provisioned Package via DISM (for FUTURE users)
+            $ProvisionedPackages = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*$AppPattern*" -or $_.PackageName -like "*$AppPattern*" }
+            if ($ProvisionedPackages) {
+                Write-Host "  - Removing provisioned package via DISM..."
+                foreach ($Package in $ProvisionedPackages) {
+                    $DismArgs = "/Online /Remove-ProvisionedAppxPackage /PackageName:$($Package.PackageName)"
+                    Start-Process "dism.exe" -ArgumentList $DismArgs -Wait -NoNewWindow | Out-Null
                 }
-            } catch {
-                Write-Warning "    - An error occurred while trying to use winget for '$AppPattern'."
             }
-        }
 
-        # --- STRATEGY 2: Fallback to your original, proven PowerShell method ---
-        if (-not $AppRemoved) {
-            if ($WingetPath) { Write-Host "  - Winget method failed or app not found. Falling back to PowerShell AppX method..." }
-            else { Write-Host "  - Winget not found. Using PowerShell AppX method..." }
-            
-            $AppWildcard = "*$AppPattern*"
-
-            try {
-                # 1. Remove Provisioned Package (for future users) - Your original logic
-                $Provisioned = Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like $AppWildcard }
-                if ($Provisioned) {
-                    $Provisioned | ForEach-Object { Remove-AppxProvisionedPackage -Online -AllUsers -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null }
-                }
-
-                # 2. Remove Installed Package - Your original logic
-                $Installed = Get-AppxPackage -Name $AppWildcard -AllUsers
+            # Step 2: Remove for EXISTING users
+            # For stubborn apps like Xbox, use Winget. For others, use Remove-AppxPackage.
+            if ($AppPattern -like "*Microsoft.GamingApp*" -and $WingetPath) {
+                Write-Host "  - Removing Xbox for existing users via winget..."
+                Start-Process winget -ArgumentList "uninstall --id 9MV0B5HZVK9Z --accept-source-agreements --disable-interactivity --silent" -Wait -NoNewWindow | Out-Null
+            } else {
+                $Installed = Get-AppxPackage -AllUsers -Name "*$AppPattern*" -ErrorAction SilentlyContinue
                 if ($Installed) {
+                    Write-Host "  - Removing installed package from user profiles..."
                     $Installed | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Out-Null
                 }
-                
-                # Verify removal
-                if (-not (Get-AppxPackage -Name $AppWildcard -AllUsers)) {
-                    Write-Host "    - Successfully uninstalled '$AppPattern' via PowerShell."
-                } else {
-                     Write-Warning "    - PowerShell method failed to remove '$AppPattern'. The package may be protected or in use."
-                }
-            } catch {
-                Write-Warning "    - A critical error occurred during PowerShell removal for '$AppPattern'."
             }
-        }
+        } catch { Write-Warning "  - An error occurred during the removal process for '$AppPattern'." }
     }
-    Write-Output ""
 }
 #------------------------------------------------
 
@@ -887,77 +846,107 @@ function Set-WindowsNtpServer {
 }
 
 # =================================================================================================
-# FINAL, DEFINITIVE Set-ProgramAutostart FUNCTION (v2 - CORRECTED CRASHING BUG)
-# It directly modifies the StartupApproved key, which is what Task Manager uses.
+# FINAL AUTOSART METHOD (v2 - Simple .REG file creation)
 # =================================================================================================
-function Set-ProgramAutostart {
+
+Write-Host "`n--- Autostart Configuration ---" -ForegroundColor Yellow
+
+# --- Create the .reg file content ---
+$RegFileContent = @"
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run]
+"MicrosoftEdgeAutoLaunch_29EBC4579851B72EE312C449CF839B1A"=hex:03,00,00,00,00,00,00,00,00,00,00,00
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run]
+"OneDrive"=hex:03,00,00,00,00,00,00,00,00,00,00,00
+"@
+
+# Find the currently logged-in user's desktop path
+$UserDesktop = ""
+try {
+    $ExplorerProcess = Get-WmiObject -Class Win32_Process -Filter "Name = 'explorer.exe'" | Select-Object -First 1
+    $OwnerInfo = $ExplorerProcess.GetOwner()
+    $UserName = $OwnerInfo.User
+    $UserDesktop = "C:\Users\$UserName\Desktop"
+} catch {
+    Write-Warning "Could not automatically determine the logged-in user's desktop."
+}
+
+if (Test-Path $UserDesktop) {
+    $UserRegPath = Join-Path -Path $UserDesktop -ChildPath "Disable Autostart Programs.reg"
+    try {
+        Set-Content -Path $UserRegPath -Value $RegFileContent -Encoding Unicode
+        Write-Host "ACTION REQUIRED: A new registry file has been created on your desktop:" -ForegroundColor Cyan
+        Write-Host "'Disable Autostart Programs.reg'" -ForegroundColor Cyan
+        Write-Host "Please DOUBLE-CLICK this new file and accept the prompt to finalize the changes." -ForegroundColor Cyan
+    } catch {
+        Write-Warning "Could not create the registry file on the desktop. Error: $($_.Exception.Message)"
+    }
+}
+Write-Host "--- Autostart Configuration Finished ---"
+
+# =================================================================================================
+# NEW FUNCTION - Sets default UI settings for all NEW users
+# =================================================================================================
+function Set-DefaultUserSettings {
     [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ExecutableName,
+    param()
 
-        [Parameter(Mandatory = $false)]
-        [string]$RegistryValueName # Optional: Use for apps with a specific, known Run key name like "OneDrive"
-    )
+    Write-Host "> Applying default UI settings for all new users..." -ForegroundColor Yellow
 
-    Write-Host "> Disabling Autostart for '$ExecutableName' for all users..." -ForegroundColor Yellow
-    $ItemsChanged = $false
+    # --- 1. Set a clean default taskbar layout (Removes Store, Outlook, etc.) ---
+    # This XML defines a taskbar with only File Explorer and Edge.
+    $XMLContent = @"
+<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+    <defaultlayout:TaskbarLayout>
+      <taskbar:TaskbarPinList>
+        <taskbar:DesktopApp DesktopApplicationLinkPath="%APPDATA%\Microsoft\Windows\Start Menu\Programs\System Tools\File Explorer.lnk" />
+        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" />
+      </taskbar:TaskbarPinList>
+    </defaultlayout:TaskbarLayout>
+  </CustomTaskbarLayoutCollection>
+</LayoutModificationTemplate>
+"@
+    $LayoutFilePath = "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml"
+    try {
+        if (-not (Test-Path (Split-Path $LayoutFilePath))) { New-Item -Path (Split-Path $LayoutFilePath) -ItemType Directory -Force | Out-Null }
+        Set-Content -Path $LayoutFilePath -Value $XMLContent -Encoding UTF8 -Force
+        Write-Host "  - Default taskbar layout has been set for new users."
+    } catch { Write-Warning "  - Could not set the default taskbar layout. Error: $($_.Exception.Message)" }
 
-    # --- This is the focused action to disable a startup item for a single user's hive ---
-    $UserDisableAction = {
-        param($UserHivePath)
-        $ActionTaken = $false
-        $RunKeyPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Run"
-        $StartupApprovedPath = "$($UserHivePath)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
-        
-        $DisabledValue = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
-        $TargetValueName = $null
-        
-        if ($RegistryValueName) {
-            # If a specific name is provided (like for OneDrive), we use that.
-            if (Get-ItemProperty -Path $RunKeyPath -Name $RegistryValueName -ErrorAction SilentlyContinue) {
-                $TargetValueName = $RegistryValueName
-            }
-        } else {
-            # Otherwise, we search all values in the Run key for the executable.
-            $RunKeyProperties = Get-ItemProperty -Path $RunKeyPath -ErrorAction SilentlyContinue
-            if ($null -ne $RunKeyProperties) {
-                # --- THIS IS THE FIX: Removed the invalid '$using:' scope modifier ---
-                $RunKeyProperties.PSObject.Properties | ForEach-Object {
-                    if ($_.Value -is [string] -and $_.Value.ToLower().Contains($ExecutableName.ToLower())) {
-                        $TargetValueName = $_.Name
-                        break
-                    }
-                }
-            }
-        }
-        
-        if ($TargetValueName) {
-            Write-Verbose "  - Found startup entry '$TargetValueName' to disable for hive $UserHivePath"
-            try {
-                if (-not (Test-Path $StartupApprovedPath)) { New-Item -Path $StartupApprovedPath -Force | Out-Null }
-                Set-ItemProperty -Path $StartupApprovedPath -Name $TargetValueName -Value $DisabledValue -Type Binary -Force -ErrorAction Stop
-                $ActionTaken = $true
-            } catch {
-                 Write-Warning "    - Failed to write 'Disabled' value for '$TargetValueName'."
-            }
-        }
-        return $ActionTaken
-    }
-
-    # --- Apply this action to every user's registry hive ---
+    # --- 2. Load Default User Hive to apply registry changes ---
     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (Test-Path $DefaultUserPath) {
-        try { reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null; if (& $UserDisableAction "HKU:\DefaultUserHive") { $ItemsChanged = $true } } catch {} finally { reg unload "HKU\DefaultUserHive" | Out-Null }
+    if (-not (Test-Path $DefaultUserPath)) {
+        Write-Warning "  - Default User profile hive not found. Cannot apply other new user settings."
+        return
     }
-    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-        $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}; if(Test-Path "Registry::HKEY_USERS\$sid"){if (& $UserDisableAction "HKU:\$sid") { $ItemsChanged = $true }}else{try{reg load "HKU\TempUserHive" $nud|Out-Null; if (& $UserDisableAction "HKU:\TempUserHive") { $ItemsChanged = $true }}catch{}finally{reg unload "HKU\TempUserHive"|Out-Null}}
-    }
-
-    if ($ItemsChanged) { Write-Host "  - Autostart entries for '$ExecutableName' were successfully set to 'Disabled'."}
     
-    return $ItemsChanged
+    try {
+        Write-Host "  - Loading Default User hive to apply registry settings..."
+        reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
+
+        # --- Hide the Search Bar on the Taskbar for new users ---
+        $SearchKey = "HKU:\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Search"
+        if (-not (Test-Path $SearchKey)) { New-Item -Path $SearchKey -Force | Out-Null }
+        Set-ItemProperty -Path $SearchKey -Name "SearchboxTaskbarMode" -Value 0 -Type DWord -Force
+        
+        # --- Revert to the old Context Menu for new users ---
+        $ContextMenuKey = "HKU:\DefaultUserHive\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+        if (-not (Test-Path $ContextMenuKey)) { New-Item -Path $ContextMenuKey -Force -Recurse | Out-Null }
+        Set-ItemProperty -Path $ContextMenuKey -Name "(Default)" -Value "" -Type String -Force
+
+        Write-Host "  - Search bar and context menu settings applied for new users."
+    }
+    catch {
+        Write-Warning "  - An error occurred while modifying the Default User hive. Error: $($_.Exception.Message)"
+    }
+    finally {
+        # CRITICAL: Always unload the hive
+        reg unload "HKU\DefaultUserHive" | Out-Null
+        Write-Host "  - Default User hive has been unloaded."
+    }
 }
 ##################################################################################################################
 #                                                                                                                #
@@ -1293,7 +1282,7 @@ if ((-not $global:Params.Count) -or $RunDefaults -or $RunWin11Defaults -or $RunS
                 Read-Host | Out-Null
             }
 
-            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle'
+            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle','HighPerformance'
 
             PrintHeader 'Default Mode'
 
@@ -1903,6 +1892,20 @@ else {
             RegImport "> Power Hibernation boot Enabled Off..." "Power_Hibernation_boot_Enabled_Off.reg"
             continue
         }
+	'HighPerformance' {
+    	RegImport "> Enabling High Performance Power Plan option..." "Enable_High_Performance.reg"
+    	Write-Host "  - Setting the High Performance power plan as active..."
+   		 # This command finds the GUID for High Performance and activates it.
+    	$HighPerfGUID = (powercfg -l | Where-Object { $_ -match "High performance" }).Split(' ')[3]
+    	if ($HighPerfGUID) {
+        	powercfg -s $HighPerfGUID
+    	} else {
+        	# Fallback in case the import didn't work and the plan isn't visible yet.
+        	# The GUID for High Performance is static.
+        	powercfg -s 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+    	}
+    	continue
+	}	
 	'HideNewOutlookToggle' {
    			RegImport "> Disabling the 'Try the new Outlook' toggle in Classic Outlook for all users..." "Disable_New_Outlook_Toggle.reg"
    			continue
@@ -1933,6 +1936,7 @@ else {
             continue
         }
     }
+	Set-DefaultUserSettings
 
     RestartExplorer
 
