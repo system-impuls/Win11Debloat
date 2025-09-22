@@ -887,7 +887,7 @@ if (Test-Path $UserDesktop) {
 Write-Host "--- Autostart Configuration Finished ---"
 
 # =================================================================================================
-# NEW FUNCTION - Sets default UI settings for all NEW users
+# FINAL, DEFINITIVE Set-DefaultUserSettings FUNCTION (Uses reg.exe for reliability)
 # =================================================================================================
 function Set-DefaultUserSettings {
     [CmdletBinding()]
@@ -896,7 +896,7 @@ function Set-DefaultUserSettings {
     Write-Host "> Applying default UI settings for all new users..." -ForegroundColor Yellow
 
     # --- 1. Set a clean default taskbar layout (Removes Store, Outlook, etc.) ---
-    # This XML defines a taskbar with only File Explorer and Edge.
+    # This part is correct and remains the same.
     $XMLContent = @"
 <LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">
   <CustomTaskbarLayoutCollection PinListPlacement="Replace">
@@ -916,7 +916,7 @@ function Set-DefaultUserSettings {
         Write-Host "  - Default taskbar layout has been set for new users."
     } catch { Write-Warning "  - Could not set the default taskbar layout. Error: $($_.Exception.Message)" }
 
-    # --- 2. Load Default User Hive to apply registry changes ---
+    # --- 2. Load Default User Hive to apply registry changes via reg.exe ---
     $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
     if (-not (Test-Path $DefaultUserPath)) {
         Write-Warning "  - Default User profile hive not found. Cannot apply other new user settings."
@@ -927,15 +927,16 @@ function Set-DefaultUserSettings {
         Write-Host "  - Loading Default User hive to apply registry settings..."
         reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
 
-        # --- Hide the Search Bar on the Taskbar for new users ---
-        $SearchKey = "HKU:\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Search"
-        if (-not (Test-Path $SearchKey)) { New-Item -Path $SearchKey -Force | Out-Null }
-        Set-ItemProperty -Path $SearchKey -Name "SearchboxTaskbarMode" -Value 0 -Type DWord -Force
+        # --- THIS IS THE CRITICAL FIX ---
+        # We use the native reg.exe ADD command, which is more reliable for offline hives.
         
-        # --- Revert to the old Context Menu for new users ---
-        $ContextMenuKey = "HKU:\DefaultUserHive\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
-        if (-not (Test-Path $ContextMenuKey)) { New-Item -Path $ContextMenuKey -Force -Recurse | Out-Null }
-        Set-ItemProperty -Path $ContextMenuKey -Name "(Default)" -Value "" -Type String -Force
+        # Hide the Search Bar on the Taskbar for new users (Value 0 = Hide Icon and Label)
+        $SearchKey = "HKEY_USERS\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Search"
+        reg add $SearchKey /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f | Out-Null
+        
+        # Revert to the old Context Menu for new users
+        $ContextMenuKey = "HKEY_USERS\DefaultUserHive\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+        reg add $ContextMenuKey /ve /f | Out-Null # /ve sets the (Default) value, /f forces overwrite
 
         Write-Host "  - Search bar and context menu settings applied for new users."
     }
@@ -1095,53 +1096,8 @@ else {
     }
 }
 
-Write-Host "`n--- Configuring Autostart Programs ---"
-
-# =================================================================================================
-# FINAL INTERACTIVE AUTOSART CONFIGURATION SECTION (using the generic function)
-# =================================================================================================
-
-Write-Host "`n--- Interactive Autostart Configuration ---" -ForegroundColor Yellow
-
-# --- Configure Microsoft Edge Autostart ---
-$choiceEdge = Read-Host "Do you want to disable Microsoft Edge from starting automatically? (y/n)"
-if ($choiceEdge -eq 'y') {
-    # We search for any Run key value that contains "msedge.exe"
-    if (Set-ProgramAutostart -ExecutableName "msedge.exe") {
-        Write-Host "Microsoft Edge autostart has been disabled." -ForegroundColor Green
-    } else {
-        Write-Host "No active Microsoft Edge autostart entries were found to disable."
-    }
-} else {
-    Write-Host "Skipping Microsoft Edge autostart configuration."
-}
-Write-Output ""
-
-# --- Configure OneDrive Autostart ---
-$choiceOneDrive = Read-Host "Do you want to disable OneDrive from starting automatically? (y/n)"
-if ($choiceOneDrive -eq 'y') {
-    # OneDrive uses a specific, known Run key value named "OneDrive". Targeting it directly is more precise.
-    if (Set-ProgramAutostart -ExecutableName "OneDrive.exe" -RegistryValueName "OneDrive") {
-        Write-Host "OneDrive autostart has been disabled." -ForegroundColor Green
-    } else {
-        Write-Host "No active OneDrive autostart entries were found to disable."
-    }
-} else {
-    Write-Host "Skipping OneDrive autostart configuration."
-}
-Write-Output ""
-
-# --- Example for Future Use: Microsoft Teams ---
-# $choiceTeams = Read-Host "Do you want to disable Microsoft Teams from starting automatically? (y/n)"
-# if ($choiceTeams -eq 'y') {
-#     if (Set-ProgramAutostart -ExecutableName "Teams.exe") {
-#         Write-Host "Microsoft Teams autostart has been disabled." -ForegroundColor Green
-#     }
-# }
-# Write-Output ""
 
 
-Write-Host "--- Autostart Configuration Finished ---"
 
 # Change NTP Server
 if (Set-WindowsNtpServer -NtpServerAddress "de.pool.ntp.org") { # Or your desired server
