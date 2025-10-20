@@ -55,7 +55,8 @@ param (
     [switch]$StartLayout,
     [switch]$HiberbootEnabled,
 	[switch]$HideNewOutlookToggle,
- 	[switch]$HighPerformance
+ 	[switch]$HighPerformance,
+	[switch]$SetDisplayScale125
 )
 
 
@@ -1238,7 +1239,7 @@ if ((-not $global:Params.Count) -or $RunDefaults -or $RunWin11Defaults -or $RunS
                 Read-Host | Out-Null
             }
 
-            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle','HighPerformance'
+            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle','HighPerformance','SetDisplayScale125'
 
             PrintHeader 'Default Mode'
 
@@ -1867,6 +1868,10 @@ else {
 		Write-Host "  - High Performance plan activated with custom timeouts."
     	continue
 	}	
+	'SetDisplayScale125' {
+                RegImport "> Setting display scale to 125% for all existing users..." "Set_Display_Scale_125.reg"
+                continue
+            }
 	'HideNewOutlookToggle' {
    			RegImport "> Disabling the 'Try the new Outlook' toggle in Classic Outlook for all users..." "Disable_New_Outlook_Toggle.reg"
    			continue
@@ -1898,6 +1903,10 @@ else {
         }
     }
 	Set-DefaultUserSettings
+	if ($global:Params.ContainsKey('SetDisplayScale125')) {
+                Write-Host "  - Setting display scale to 125% for new users..."
+                Apply-RegToDefaultUser "Set_Display_Scale_125.reg"
+            }
 
     RestartExplorer
 
