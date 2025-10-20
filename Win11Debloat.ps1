@@ -1055,10 +1055,10 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 
 
-powercfg /change monitor-timeout-ac 45
-powercfg /change monitor-timeout-dc 15
-powercfg /change standby-timeout-ac 0
-powercfg /change standby-timeout-dc 60
+#powercfg /change monitor-timeout-ac 45
+#powercfg /change monitor-timeout-dc 15
+#powercfg /change standby-timeout-ac 0
+#powercfg /change standby-timeout-dc 60
 
 Set-Volume -DriveLetter 'C' -NewFileSystemLabel 'System'
 
@@ -1860,6 +1860,11 @@ else {
         	# The GUID for High Performance is static.
         	powercfg -s 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
     	}
+		Write-Host "  - Applying custom monitor timeouts to the High Performance plan..."
+            powercfg /change monitor-timeout-ac 45  # 45 minutes when plugged in
+            powercfg /change monitor-timeout-dc 15  # 15 minutes on battery
+
+		Write-Host "  - High Performance plan activated with custom timeouts."
     	continue
 	}	
 	'HideNewOutlookToggle' {
