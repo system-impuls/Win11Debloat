@@ -473,10 +473,12 @@ function Strip-Progress {
 }
 
 # =================================================================================================
-# NEW AND IMPROVED RegImport FUNCTION (v2) - Fixes "File in Use" Error for Logged-In User
-# This function intelligently applies registry files to all existing and future users.
+# FINAL, DEFINITIVE RegImport FUNCTION (v3)
+# Uses the proven "rewrite .reg file" method for existing users.
+# Uses the more robust "reg.exe add" method for the Default User profile (new users).
 # =================================================================================================
 function RegImport {
+    [CmdletBinding()]
     param (
         [string]$Message,
         [string]$RegFilePath
@@ -495,29 +497,46 @@ function RegImport {
 
     # --- Apply HKLM (System-Wide) Settings ---
     if ($RegContent -match '\[HKEY_LOCAL_MACHINE\\') {
-        Write-Verbose "Applying HKLM settings from '$RegFilePath'..."
         reg import $FullRegPath | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "An error occurred while importing HKLM settings from '$RegFilePath'."
-        } else {
-            Write-Host "  Successfully applied system-wide (HKLM) settings." -ForegroundColor DarkGray
-        }
+        if ($LASTEXITCODE -eq 0) { Write-Host "  Successfully applied system-wide (HKLM) settings." -ForegroundColor DarkGray }
+        else { Write-Warning "An error occurred while importing HKLM settings from '$RegFilePath'." }
     }
 
-    # --- Apply HKCU (User-Specific) Settings to All Users and Default Profile ---
+    # --- Apply HKCU (User-Specific) Settings ---
     if ($RegContent -match '\[HKEY_CURRENT_USER\\') {
-        Write-Verbose "Applying HKCU settings from '$RegFilePath' to all users..."
 
-        # 1. Modify the Default User profile (for all future users)
+        # --- Part 1: Modify the Default User profile (for FUTURE users) using REG.EXE ADD ---
+        # This is the most reliable method for the offline Default User hive.
         $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
         if (Test-Path $DefaultUserPath) {
             try {
-                Write-Verbose "  - Loading Default User profile hive..."
                 reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
-                $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\DefaultUserHive'
-                Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
-                reg import $TempRegFile | Out-Null
-                Write-Host "  Applied settings to Default User Profile (for new users)." -ForegroundColor DarkGray
+                Write-Host "  Applying settings to Default User Profile (for new users)..." -ForegroundColor DarkGray
+
+                # Parse the .reg file and convert it to reg.exe add commands
+                $RegLines = $RegContent -split '(\r\n|\n|\r)' | Where-Object { $_.Trim() -ne "" -and $_ -notlike "*Version*" }
+                $CurrentKey = ""
+                foreach ($Line in $RegLines) {
+                    if ($Line.StartsWith("[")) {
+                        $CurrentKey = $Line.Trim("[]") -replace 'HKEY_CURRENT_USER', 'HKEY_USERS\DefaultUserHive'
+                    } elseif ($Line.Contains("=")) {
+                        $ValueName = ($Line -split '=')[0].Trim('"')
+                        if ($ValueName -eq "@") { $ValueName = "" } # Represents "(Default)" value
+                        $ValueData = ($Line -split '=', 2)[1]
+
+                        if ($ValueData.StartsWith("dword:")) {
+                            $DataType = "REG_DWORD"
+                            $Data = "0x" + $ValueData.Replace("dword:", "")
+                            reg add $CurrentKey /v $ValueName /t $DataType /d $Data /f | Out-Null
+                        } elseif ($ValueData.StartsWith("hex:")) {
+                            # reg.exe add does not have a simple way to add complex hex values, but most tweaks are dword/string
+                        } else {
+                            $DataType = "REG_SZ"
+                            $Data = $ValueData.Trim('"')
+                            reg add $CurrentKey /v $ValueName /t $DataType /d $Data /f | Out-Null
+                        }
+                    }
+                }
             } catch {
                 Write-Warning "  Could not apply settings to Default User Profile. Error: $($_.Exception.Message)"
             } finally {
@@ -527,57 +546,37 @@ function RegImport {
             Write-Warning "  Default User profile hive not found at '$DefaultUserPath'."
         }
 
-        # PERFORMANCE OPTIMIZATION: Get all user SIDs once.
+        # --- Part 2: Modify all EXISTING user profiles using the rewrite .reg file method ---
+        # This method is reliable for live/loaded user hives.
         $UserSIDs = @{}
         try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.Name] = $_.SID } } catch {}
-
-        # 2. Modify all existing user profiles
         Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-            $UserProfile = $_
-            $NTUserDataFile = Join-Path -Path $UserProfile.FullName -ChildPath "NTUSER.DAT"
+            $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
+            if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
+            $UserSID = $UserSIDs[$UserProfile.Name]; if (-not $UserSID) { return }
 
-            # Skip special profiles
-            if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) {
-                return
-            }
-            
-            $UserSID = $UserSIDs[$UserProfile.Name]
-            if (-not $UserSID) { return } # Skip if user has no SID
-
-            # ---- CORE LOGIC FIX ----
-            # Check if the user's hive is already loaded (meaning they are logged in)
             if (Test-Path "Registry::HKEY_USERS\$UserSID") {
-                # THE FIX: User is logged in, so we modify their already loaded hive directly.
                 Write-Host "  Applying settings to logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
                 try {
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', "[HKEY_USERS\$UserSID"
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
-                } catch {
-                    Write-Warning "  Could not apply settings to logged-in user $($UserProfile.Name). Error: $($_.Exception.Message)"
-                }
+                } catch { Write-Warning "  Could not apply settings to logged-in user $($UserProfile.Name)." }
             } else {
-                # User is NOT logged in, so we can safely load their hive temporarily.
                 Write-Host "  Applying settings to logged-off user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
                 try {
                     reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\TempUserHive'
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
-                } catch {
-                    Write-Warning "  Could not load or apply settings to user profile $($UserProfile.Name). Error: $($_.Exception.Message)"
-                } finally {
-                    # CRITICAL: Always unload the hive, even if an error occurred
-                    reg unload "HKU\TempUserHive" | Out-Null
-                }
+                } catch { Write-Warning "  Could not apply settings to user profile $($UserProfile.Name)."
+                } finally { reg unload "HKU\TempUserHive" | Out-Null }
             }
         }
-        # Clean up the temporary reg file
         Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
     }
     Write-Output ""
 }
-
 # Restart the Windows Explorer process
 function RestartExplorer {
     Write-Output "> Restarting Windows Explorer process to apply all changes... (This may cause some flickering)"
@@ -890,15 +889,11 @@ Write-Host "--- Autostart Configuration Finished ---"
 # =================================================================================================
 # FINAL, DEFINITIVE Set-DefaultUserSettings FUNCTION (Uses reg.exe for reliability)
 # =================================================================================================
-function Set-DefaultUserSettings {
+function Set-DefaultTaskbarLayout {
     [CmdletBinding()]
     param()
-
-    Write-Host "> Applying default UI settings for all new users..." -ForegroundColor Yellow
-
-    # --- 1. Set a clean default taskbar layout (Removes Store, Outlook, etc.) ---
-    # This part is correct and remains the same.
-    $XMLContent = @"
+    Write-Host "> Applying a clean default taskbar layout for all new users..." -ForegroundColor Yellow
+    $XMLContent = @'
 <LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">
   <CustomTaskbarLayoutCollection PinListPlacement="Replace">
     <defaultlayout:TaskbarLayout>
@@ -909,46 +904,13 @@ function Set-DefaultUserSettings {
     </defaultlayout:TaskbarLayout>
   </CustomTaskbarLayoutCollection>
 </LayoutModificationTemplate>
-"@
+'@
     $LayoutFilePath = "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml"
     try {
         if (-not (Test-Path (Split-Path $LayoutFilePath))) { New-Item -Path (Split-Path $LayoutFilePath) -ItemType Directory -Force | Out-Null }
         Set-Content -Path $LayoutFilePath -Value $XMLContent -Encoding UTF8 -Force
-        Write-Host "  - Default taskbar layout has been set for new users."
-    } catch { Write-Warning "  - Could not set the default taskbar layout. Error: $($_.Exception.Message)" }
-
-    # --- 2. Load Default User Hive to apply registry changes via reg.exe ---
-    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (-not (Test-Path $DefaultUserPath)) {
-        Write-Warning "  - Default User profile hive not found. Cannot apply other new user settings."
-        return
-    }
-    
-    try {
-        Write-Host "  - Loading Default User hive to apply registry settings..."
-        reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
-
-        # --- THIS IS THE CRITICAL FIX ---
-        # We use the native reg.exe ADD command, which is more reliable for offline hives.
-        
-        # Hide the Search Bar on the Taskbar for new users (Value 0 = Hide Icon and Label)
-        $SearchKey = "HKEY_USERS\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Search"
-        reg add $SearchKey /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f | Out-Null
-        
-        # Revert to the old Context Menu for new users
-        $ContextMenuKey = "HKEY_USERS\DefaultUserHive\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
-        reg add $ContextMenuKey /ve /f | Out-Null # /ve sets the (Default) value, /f forces overwrite
-
-        Write-Host "  - Search bar and context menu settings applied for new users."
-    }
-    catch {
-        Write-Warning "  - An error occurred while modifying the Default User hive. Error: $($_.Exception.Message)"
-    }
-    finally {
-        # CRITICAL: Always unload the hive
-        reg unload "HKU\DefaultUserHive" | Out-Null
-        Write-Host "  - Default User hive has been unloaded."
-    }
+        Write-Host "  - Default taskbar XML layout has been set for new users."
+    } catch { Write-Warning "  - Could not set the default taskbar layout XML. Error: $($_.Exception.Message)" }
 }
 ##################################################################################################################
 #                                                                                                                #
@@ -1902,7 +1864,7 @@ else {
             continue
         }
     }
-	Set-DefaultUserSettings
+	Set-DefaultTaskbarLayout
 
     RestartExplorer
 
