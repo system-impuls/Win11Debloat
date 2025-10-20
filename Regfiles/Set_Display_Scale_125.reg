@@ -1,0 +1,3 @@
+[HKEY_CURRENT_USER\Control Panel\Desktop]
+    "LogPixels"=dword:00000078
+    "Win8DpiScaling"=dword:00000001
