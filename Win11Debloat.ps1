@@ -1903,10 +1903,6 @@ else {
         }
     }
 	Set-DefaultUserSettings
-	if ($global:Params.ContainsKey('SetDisplayScale125')) {
-                Write-Host "  - Setting display scale to 125% for new users..."
-                Apply-RegToDefaultUser "Set_Display_Scale_125.reg"
-            }
 
     RestartExplorer
 
