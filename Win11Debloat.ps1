@@ -861,32 +861,7 @@ if (Test-Path $UserDesktop) {
 }
 Write-Host "--- Autostart Configuration Finished ---"
 
-# =================================================================================================
-# FINAL, DEFINITIVE Set-DefaultUserSettings FUNCTION (Uses reg.exe for reliability)
-# =================================================================================================
-function Set-DefaultTaskbarLayout {
-    [CmdletBinding()]
-    param()
-    Write-Host "> Applying a clean default taskbar layout for all new users..." -ForegroundColor Yellow
-    $XMLContent = @'
-<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">
-  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
-    <defaultlayout:TaskbarLayout>
-      <taskbar:TaskbarPinList>
-        <taskbar:DesktopApp DesktopApplicationLinkPath="%APPDATA%\Microsoft\Windows\Start Menu\Programs\System Tools\File Explorer.lnk" />
-        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" />
-      </taskbar:TaskbarPinList>
-    </defaultlayout:TaskbarLayout>
-  </CustomTaskbarLayoutCollection>
-</LayoutModificationTemplate>
-'@
-    $LayoutFilePath = "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml"
-    try {
-        if (-not (Test-Path (Split-Path $LayoutFilePath))) { New-Item -Path (Split-Path $LayoutFilePath) -ItemType Directory -Force | Out-Null }
-        Set-Content -Path $LayoutFilePath -Value $XMLContent -Encoding UTF8 -Force
-        Write-Host "  - Default taskbar XML layout has been set for new users."
-    } catch { Write-Warning "  - Could not set the default taskbar layout XML. Error: $($_.Exception.Message)" }
-}
+
 ##################################################################################################################
 #                                                                                                                #
 #                                                  SCRIPT START                                                  #
@@ -1839,7 +1814,30 @@ else {
             continue
         }
     }
-	Set-DefaultTaskbarLayout
+
+	# =================================================================================================
+# FINAL STEP: Apply the clean Taskbar Layout XML for NEW USERS
+# This is the only special "new user" setting needed. Everything else is handled by RegImport.
+# =================================================================================================
+Write-Host "`n> Applying a clean default taskbar layout for all new users..." -ForegroundColor Yellow
+$XMLContent = @'
+<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+    <defaultlayout:TaskbarLayout>
+      <taskbar:TaskbarPinList>
+        <taskbar:DesktopApp DesktopApplicationLinkPath="%APPDATA%\Microsoft\Windows\Start Menu\Programs\System Tools\File Explorer.lnk" />
+        <taskbar:DesktopApp DesktopApplicationLinkPath="%ALLUSERSPROFILE%\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk" />
+      </taskbar:TaskbarPinList>
+    </defaultlayout:TaskbarLayout>
+  </CustomTaskbarLayoutCollection>
+</LayoutModificationTemplate>
+'@
+$LayoutFilePath = "$env:SystemDrive\Users\Default\AppData\Local\Microsoft\Windows\Shell\LayoutModification.xml"
+try {
+    if (-not (Test-Path (Split-Path $LayoutFilePath))) { New-Item -Path (Split-Path $LayoutFilePath) -ItemType Directory -Force | Out-Null }
+    Set-Content -Path $LayoutFilePath -Value $XMLContent -Encoding UTF8 -Force
+    Write-Host "  - Default taskbar XML layout has been set for new users."
+} catch { Write-Warning "  - Could not set the default taskbar layout XML. Error: $($_.Exception.Message)" }
 
     RestartExplorer
 
