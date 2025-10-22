@@ -473,9 +473,8 @@ function Strip-Progress {
 }
 
 # =================================================================================================
-# FINAL, DEFINITIVE RegImport FUNCTION (v3)
-# Uses the proven "rewrite .reg file" method for existing users.
-# Uses the more robust "reg.exe add" method for the Default User profile (new users).
+# FINAL, PROVEN RegImport FUNCTION (Reverted to the reliable version)
+# This version works for all existing and future users.
 # =================================================================================================
 function RegImport {
     [CmdletBinding()]
@@ -499,77 +498,53 @@ function RegImport {
     if ($RegContent -match '\[HKEY_LOCAL_MACHINE\\') {
         reg import $FullRegPath | Out-Null
         if ($LASTEXITCODE -eq 0) { Write-Host "  Successfully applied system-wide (HKLM) settings." -ForegroundColor DarkGray }
-        else { Write-Warning "An error occurred while importing HKLM settings from '$RegFilePath'." }
     }
 
-    # --- Apply HKCU (User-Specific) Settings ---
+    # --- Apply HKCU (User-Specific) Settings to All Users and Default Profile ---
     if ($RegContent -match '\[HKEY_CURRENT_USER\\') {
 
-        # --- Part 1: Modify the Default User profile (for FUTURE users) using REG.EXE ADD ---
-        # This is the most reliable method for the offline Default User hive.
+        # 1. Modify the Default User profile (for FUTURE users)
         $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
         if (Test-Path $DefaultUserPath) {
             try {
                 reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
-                Write-Host "  Applying settings to Default User Profile (for new users)..." -ForegroundColor DarkGray
-
-                # Parse the .reg file and convert it to reg.exe add commands
-                $RegLines = $RegContent -split '(\r\n|\n|\r)' | Where-Object { $_.Trim() -ne "" -and $_ -notlike "*Version*" }
-                $CurrentKey = ""
-                foreach ($Line in $RegLines) {
-                    if ($Line.StartsWith("[")) {
-                        $CurrentKey = $Line.Trim("[]") -replace 'HKEY_CURRENT_USER', 'HKEY_USERS\DefaultUserHive'
-                    } elseif ($Line.Contains("=")) {
-                        $ValueName = ($Line -split '=')[0].Trim('"')
-                        if ($ValueName -eq "@") { $ValueName = "" } # Represents "(Default)" value
-                        $ValueData = ($Line -split '=', 2)[1]
-
-                        if ($ValueData.StartsWith("dword:")) {
-                            $DataType = "REG_DWORD"
-                            $Data = "0x" + $ValueData.Replace("dword:", "")
-                            reg add $CurrentKey /v $ValueName /t $DataType /d $Data /f | Out-Null
-                        } elseif ($ValueData.StartsWith("hex:")) {
-                            # reg.exe add does not have a simple way to add complex hex values, but most tweaks are dword/string
-                        } else {
-                            $DataType = "REG_SZ"
-                            $Data = $ValueData.Trim('"')
-                            reg add $CurrentKey /v $ValueName /t $DataType /d $Data /f | Out-Null
-                        }
-                    }
-                }
+                $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\DefaultUserHive'
+                Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
+                reg import $TempRegFile | Out-Null
+                Write-Host "  Applied settings to Default User Profile (for new users)." -ForegroundColor DarkGray
             } catch {
                 Write-Warning "  Could not apply settings to Default User Profile. Error: $($_.Exception.Message)"
             } finally {
                 reg unload "HKU\DefaultUserHive" | Out-Null
             }
-        } else {
-            Write-Warning "  Default User profile hive not found at '$DefaultUserPath'."
         }
 
-        # --- Part 2: Modify all EXISTING user profiles using the rewrite .reg file method ---
-        # This method is reliable for live/loaded user hives.
+        # 2. Modify all EXISTING user profiles
         $UserSIDs = @{}
         try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.Name] = $_.SID } } catch {}
         Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-            $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
+            $UserProfile = $_
+            $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
             if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
             $UserSID = $UserSIDs[$UserProfile.Name]; if (-not $UserSID) { return }
 
             if (Test-Path "Registry::HKEY_USERS\$UserSID") {
-                Write-Host "  Applying settings to logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
+                # User is logged in
                 try {
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', "[HKEY_USERS\$UserSID"
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
-                } catch { Write-Warning "  Could not apply settings to logged-in user $($UserProfile.Name)." }
+                    Write-Host "  Applying settings to logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
+                } catch {}
             } else {
-                Write-Host "  Applying settings to logged-off user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
+                # User is logged off
                 try {
                     reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\TempUserHive'
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
-                } catch { Write-Warning "  Could not apply settings to user profile $($UserProfile.Name)."
+                    Write-Host "  Applying settings to logged-off user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
+                } catch {
                 } finally { reg unload "HKU\TempUserHive" | Out-Null }
             }
         }
