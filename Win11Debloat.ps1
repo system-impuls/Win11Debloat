@@ -56,7 +56,8 @@ param (
     [switch]$HiberbootEnabled,
 	[switch]$HideNewOutlookToggle,
  	[switch]$HighPerformance,
-	[switch]$SetDisplayScale125
+	[switch]$SetDisplayScale125,
+	[switch]$EnableKernelStackProtection
 )
 
 
@@ -1151,7 +1152,7 @@ if ((-not $global:Params.Count) -or $RunDefaults -or $RunWin11Defaults -or $RunS
                 Read-Host | Out-Null
             }
 
-            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle','HighPerformance','SetDisplayScale125'
+            $DefaultParameterNames = 'RemoveApps','DisableTelemetry','DisableBing','DisableLockscreenTips','DisableSuggestions','ShowKnownFileExt','DisableWidgets','DisableCopilot','DisableDVR','ClearStartAllUsers','DisableRecall','RevertContextMenu','TaskbarAlignLeft','HideSearchTb','HideTaskview','ExplorerToThisPC','HideDupliDrive','SharingWizardOn','FullPath','NavPaneShowAllFolders','AutoSetup','DesktopIcons','ShowFrequentList','StartLayout','HiberbootEnabled','HideNewOutlookToggle','HighPerformance','SetDisplayScale125','EnableKernelStackProtection'
 
             PrintHeader 'Default Mode'
 
@@ -1784,6 +1785,10 @@ else {
                 RegImport "> Setting display scale to 125% for all existing users..." "Set_Display_Scale_125.reg"
                 continue
             }
+    'EnableKernelStackProtection' {
+            RegImport "> Enabling Kernel-mode Hardware-enforced Stack Protection (Reboot Required)..." "Enable_Kernel_Stack_Protection.reg"
+            continue
+        }		
 	'HideNewOutlookToggle' {
    			RegImport "> Disabling the 'Try the new Outlook' toggle in Classic Outlook for all users..." "Disable_New_Outlook_Toggle.reg"
    			continue
