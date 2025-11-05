@@ -820,7 +820,72 @@ function Set-WindowsNtpServer {
     }
     return $OverallSuccess
 }
+# =================================================================================================
+# FINAL, DEFINITIVE Set-DisplayScalingTo125 FUNCTION
+# Correctly sets registry for current and future users. Requires a sign-out.
+# =================================================================================================
+function Set-DisplayScalingTo125 {
+    [CmdletBinding()]
+    param()
 
+    Write-Host "> Setting display scale to 125% for current and future users..." -ForegroundColor Yellow
+    $DpiValue = 1 # The integer value for 125% scaling (0=100%, 1=125%, etc.)
+
+    # --- Step 1: Apply to the CURRENT USER ---
+    try {
+        Write-Host "  - Applying registry settings for the current user..."
+        $HklmBasePath = "HKLM:\SYSTEM\ControlSet001\Control\GraphicsDrivers\ScaleFactors"
+        $HkcuBasePath = "HKCU:\Control Panel\Desktop\PerMonitorSettings"
+        
+        # Find the monitor key(s) for the current user.
+        $CurrentUserMonitorKeys = Get-ChildItem -Path $HkcuBasePath -ErrorAction SilentlyContinue
+        if ($CurrentUserMonitorKeys) {
+            foreach ($MonitorKey in $CurrentUserMonitorKeys) {
+                $MonitorID = $MonitorKey.PSChildName
+                # Set both the HKCU and HKLM keys for this monitor.
+                Set-ItemProperty -Path "$($MonitorKey.PSPath)" -Name "DpiValue" -Value $DpiValue -Type DWord -Force
+                if (Test-Path "$HklmBasePath\$MonitorID") {
+                    Set-ItemProperty -Path "$HklmBasePath\$MonitorID" -Name "DpiValue" -Value $DpiValue -Type DWord -Force
+                }
+            }
+            Write-Host "    - Current user settings applied."
+        } else {
+            Write-Warning "    - Could not find monitor settings key for the current user."
+        }
+    } catch {
+        Write-Warning "  - Failed to write scaling registry values for the current user."
+    }
+
+    # --- Step 2: Apply to the Default User profile (for FUTURE users) ---
+    try {
+        Write-Host "  - Applying 125% scaling for all new users (will apply on their first login)..."
+        $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+        if (Test-Path $DefaultUserPath) {
+            reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
+            
+            # Find all possible monitor IDs from the system's hardware configuration.
+            $AllMonitorIDs = Get-ChildItem -Path "HKLM:\SYSTEM\ControlSet001\Control\GraphicsDrivers\ScaleFactors" | ForEach-Object { $_.PSChildName }
+            
+            foreach ($ID in $AllMonitorIDs) {
+                $Key = "HKEY_USERS\DefaultUserHive\Control Panel\Desktop\PerMonitorSettings\$ID"
+                # The reg add command will create the key if it doesn't exist.
+                reg add $Key /v DpiValue /t REG_DWORD /d $DpiValue /f | Out-Null
+            }
+            Write-Host "    - Default User profile settings applied."
+        }
+    }
+    catch {
+        Write-Warning "  - Could not apply scaling settings to the Default User Profile."
+    }
+    finally {
+        if (Test-Path "HKU:\DefaultUserHive") {
+            reg unload "HKU\DefaultUserHive" | Out-Null
+        }
+    }
+
+    Write-Host "  - SUCCESS: Scaling has been set to 125%." -ForegroundColor Green
+    Write-Host "  - IMPORTANT: A SIGN-OUT and SIGN-IN is required for the change to take effect." -ForegroundColor Cyan
+}
 # =================================================================================================
 # FINAL AUTOSART METHOD (v2 - Simple .REG file creation)
 # =================================================================================================
@@ -1782,8 +1847,9 @@ else {
     	continue
 	}	
 	'SetDisplayScale125' {
-                RegImport "> Setting display scale to 125% for all existing users..." "Set_Display_Scale_125.reg"
-                continue
+                 # This calls our new, dedicated, and working function.
+            Set-DisplayScalingTo125
+            continue
             }
     'EnableKernelStackProtection' {
             RegImport "> Enabling Kernel-mode Hardware-enforced Stack Protection (Reboot Required)..." "Enable_Kernel_Stack_Protection.reg"
