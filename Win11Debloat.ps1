@@ -821,70 +821,79 @@ function Set-WindowsNtpServer {
     return $OverallSuccess
 }
 # =================================================================================================
-# FINAL, DEFINITIVE Set-DisplayScalingTo125 FUNCTION
-# Correctly sets registry for current and future users. Requires a sign-out.
+# FINAL, DEFINITIVE Set-DisplayScalingTo125 FUNCTION - For ALL Existing and Future Users
 # =================================================================================================
 function Set-DisplayScalingTo125 {
     [CmdletBinding()]
     param()
 
-    Write-Host "> Setting display scale to 125% for current and future users..." -ForegroundColor Yellow
+    Write-Host "> Setting display scale to 125% for ALL users (past, present, future)..." -ForegroundColor Yellow
     $DpiValue = 1 # The integer value for 125% scaling (0=100%, 1=125%, etc.)
 
-    # --- Step 1: Apply to the CURRENT USER ---
+    # --- Step 1: Set the system-wide HKLM keys first ---
+    # This ensures the driver-level setting is in place for all monitors.
     try {
-        Write-Host "  - Applying registry settings for the current user..."
+        Write-Host "  - Applying system-wide (HKLM) registry settings for all monitors..."
         $HklmBasePath = "HKLM:\SYSTEM\ControlSet001\Control\GraphicsDrivers\ScaleFactors"
-        $HkcuBasePath = "HKCU:\Control Panel\Desktop\PerMonitorSettings"
-        
-        # Find the monitor key(s) for the current user.
-        $CurrentUserMonitorKeys = Get-ChildItem -Path $HkcuBasePath -ErrorAction SilentlyContinue
-        if ($CurrentUserMonitorKeys) {
-            foreach ($MonitorKey in $CurrentUserMonitorKeys) {
-                $MonitorID = $MonitorKey.PSChildName
-                # Set both the HKCU and HKLM keys for this monitor.
-                Set-ItemProperty -Path "$($MonitorKey.PSPath)" -Name "DpiValue" -Value $DpiValue -Type DWord -Force
-                if (Test-Path "$HklmBasePath\$MonitorID") {
-                    Set-ItemProperty -Path "$HklmBasePath\$MonitorID" -Name "DpiValue" -Value $DpiValue -Type DWord -Force
-                }
-            }
-            Write-Host "    - Current user settings applied."
-        } else {
-            Write-Warning "    - Could not find monitor settings key for the current user."
+        $AllMonitorIDs = Get-ChildItem -Path $HklmBasePath | ForEach-Object { $_.PSChildName }
+
+        foreach ($ID in $AllMonitorIDs) {
+            Set-ItemProperty -Path "$HklmBasePath\$ID" -Name "DpiValue" -Value $DpiValue -Type DWord -Force
         }
+        Write-Host "    - HKLM settings applied."
     } catch {
-        Write-Warning "  - Failed to write scaling registry values for the current user."
+        Write-Warning "  - Could not apply system-wide HKLM scaling settings."
+    }
+    
+    # --- Step 2: Define the action to be performed on each user's HKCU hive ---
+    $UserScalingAction = {
+        param($UserHivePath)
+        # Find all monitor keys within this user's hive.
+        $UserMonitorKeys = Get-ChildItem -Path "$($UserHivePath)\Control Panel\Desktop\PerMonitorSettings" -ErrorAction SilentlyContinue
+        if ($UserMonitorKeys) {
+            foreach ($MonitorKey in $UserMonitorKeys) {
+                Set-ItemProperty -Path $MonitorKey.PSPath -Name "DpiValue" -Value $DpiValue -Type DWord -Force
+            }
+        }
     }
 
-    # --- Step 2: Apply to the Default User profile (for FUTURE users) ---
+    # --- Step 3: Apply the HKCU action to all existing and future users ---
+    # Default User (for FUTURE users)
     try {
-        Write-Host "  - Applying 125% scaling for all new users (will apply on their first login)..."
+        Write-Host "  - Applying scaling settings for all FUTURE users (Default Profile)..."
         $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
         if (Test-Path $DefaultUserPath) {
             reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
             
-            # Find all possible monitor IDs from the system's hardware configuration.
-            $AllMonitorIDs = Get-ChildItem -Path "HKLM:\SYSTEM\ControlSet001\Control\GraphicsDrivers\ScaleFactors" | ForEach-Object { $_.PSChildName }
-            
+            # For the default user, we must also create the PerMonitorSettings keys if they don't exist.
             foreach ($ID in $AllMonitorIDs) {
                 $Key = "HKEY_USERS\DefaultUserHive\Control Panel\Desktop\PerMonitorSettings\$ID"
-                # The reg add command will create the key if it doesn't exist.
                 reg add $Key /v DpiValue /t REG_DWORD /d $DpiValue /f | Out-Null
             }
-            Write-Host "    - Default User profile settings applied."
         }
-    }
-    catch {
+    } catch {
         Write-Warning "  - Could not apply scaling settings to the Default User Profile."
+    } finally {
+        if (Test-Path "HKU:\DefaultUserHive") { reg unload "HKU\DefaultUserHive" | Out-Null }
     }
-    finally {
-        if (Test-Path "HKU:\DefaultUserHive") {
-            reg unload "HKU\DefaultUserHive" | Out-Null
+
+    # All EXISTING users
+    Write-Host "  - Applying scaling settings for all EXISTING user profiles..."
+    Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
+        $up = $_; $nud = "$($up.FullName)\NTUSER.DAT"; if ($up.Name -in @("Default","Public","Default User") -or !(Test-Path $nud)){return}; try {$sid=(New-Object System.Security.Principal.NTAccount($up.Name)).Translate([System.Security.Principal.SecurityIdentifier]).value}catch{return}
+        
+        Write-Verbose "    - Processing user: $($up.Name)"
+        if (Test-Path "Registry::HKEY_USERS\$sid") {
+            # User is logged in
+            & $UserScalingAction "HKU:\$sid"
+        } else {
+            # User is logged off
+            try { reg load "HKU\TempUserHive" $nud | Out-Null; & $UserScalingAction "HKU:\TempUserHive" } catch {} finally { if (Test-Path "HKU:\TempUserHive") { reg unload "HKU\TempUserHive" | Out-Null } }
         }
     }
 
-    Write-Host "  - SUCCESS: Scaling has been set to 125%." -ForegroundColor Green
-    Write-Host "  - IMPORTANT: A SIGN-OUT and SIGN-IN is required for the change to take effect." -ForegroundColor Cyan
+    Write-Host "  - SUCCESS: Scaling has been set to 125% for all users." -ForegroundColor Green
+    Write-Host "  - IMPORTANT: Users must SIGN OUT and SIGN BACK IN for the change to take effect." -ForegroundColor Cyan
 }
 # =================================================================================================
 # FINAL AUTOSART METHOD (v2 - Simple .REG file creation)
