@@ -937,6 +937,58 @@ if (Test-Path $UserDesktop) {
 Write-Host "--- Autostart Configuration Finished ---"
 
 
+# =================================================================================================
+# NEW FUNCTION - Applies all necessary UI settings to the Default Profile for NEW USERS
+# =================================================================================================
+function Set-DefaultUserSettings {
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n> Applying selected settings to the Default User profile for all future users..." -ForegroundColor Yellow
+
+    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
+    if (-not (Test-Path $DefaultUserPath)) {
+        Write-Warning "  - Default User profile hive not found. Cannot apply settings for new users."
+        return
+    }
+
+    try {
+        Write-Host "  - Loading Default User hive..."
+        reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
+
+        # --- We check each parameter and apply the corresponding setting if it was used ---
+        
+        if ($global:Params.ContainsKey('HideSearchTb')) {
+            Write-Host "  - Hiding Taskbar Search for new users..."
+            $Key = "HKEY_USERS\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Search"
+            reg add $Key /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f | Out-Null
+        }
+        
+        if ($global:Params.ContainsKey('RevertContextMenu')) {
+            Write-Host "  - Reverting Context Menu for new users..."
+            $Key = "HKEY_USERS\DefaultUserHive\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
+            reg add $Key /ve /d "" /f | Out-Null
+        }
+
+        # Add any other HKCU tweaks for new users here following the same pattern.
+        # For example:
+        if ($global:Params.ContainsKey('TaskbarAlignLeft')) {
+            Write-Host "  - Aligning Taskbar to the left for new users..."
+            $Key = "HKEY_USERS\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            reg add $Key /v TaskbarAl /t REG_DWORD /d 0 /f | Out-Null
+        }
+
+    }
+    catch {
+        Write-Warning "  - An error occurred while modifying the Default User hive. Error: $($_.Exception.Message)"
+    }
+    finally {
+        # CRITICAL: Always unload the hive
+        Write-Host "  - Unloading Default User hive."
+        reg unload "HKU\DefaultUserHive" | Out-Null
+    }
+}
+
 ##################################################################################################################
 #                                                                                                                #
 #                                                  SCRIPT START                                                  #
@@ -1919,7 +1971,8 @@ try {
     Write-Host "  - Default taskbar XML layout has been set for new users."
 } catch { Write-Warning "  - Could not set the default taskbar layout XML. Error: $($_.Exception.Message)" }
 
-    RestartExplorer
+    Set-DefaultUserSettings
+	RestartExplorer
 
     Write-Output ""
     Write-Output ""
