@@ -474,8 +474,8 @@ function Strip-Progress {
 }
 
 # =================================================================================================
-# FINAL, PROVEN RegImport FUNCTION (Reverted to the reliable version)
-# This version works for all existing and future users.
+# FINAL, DEFINITIVE RegImport FUNCTION (v4) - Correctly creates keys for Default User
+# This is the only function you need for all .reg file imports.
 # =================================================================================================
 function RegImport {
     [CmdletBinding()]
@@ -504,56 +504,70 @@ function RegImport {
     # --- Apply HKCU (User-Specific) Settings to All Users and Default Profile ---
     if ($RegContent -match '\[HKEY_CURRENT_USER\\') {
 
-        # 1. Modify the Default User profile (for FUTURE users)
+        # --- Part 1: Modify the Default User profile (for FUTURE users) ---
         $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
         if (Test-Path $DefaultUserPath) {
             try {
                 reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
+                Write-Host "  Applying settings to Default User Profile (for new users)..." -ForegroundColor DarkGray
+
+                # --- THIS IS THE CRITICAL FIX ---
+                # We must manually create the key paths in the offline hive before importing.
+                # The 'reg import' command often fails to do this on a loaded offline hive.
+                $RegLines = $RegContent -split '(\r\n|\n|\r)' | Where-Object { $_.Trim().StartsWith("[") }
+                foreach ($Line in $RegLines) {
+                    $KeyPath = $Line.Trim("[]") -replace 'HKEY_CURRENT_USER', 'HKU:\DefaultUserHive'
+                    if (-not (Test-Path $KeyPath)) {
+                        New-Item -Path $KeyPath -Force -Recurse | Out-Null
+                    }
+                }
+                
+                # Now that the keys exist, we can safely import the values.
                 $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\DefaultUserHive'
                 Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                 reg import $TempRegFile | Out-Null
-                Write-Host "  Applied settings to Default User Profile (for new users)." -ForegroundColor DarkGray
+
             } catch {
                 Write-Warning "  Could not apply settings to Default User Profile. Error: $($_.Exception.Message)"
             } finally {
-                reg unload "HKU\DefaultUserHive" | Out-Null
+                if(Test-Path "HKU:\DefaultUserHive") {
+                    reg unload "HKU\DefaultUserHive" | Out-Null
+                }
             }
         }
 
-        # 2. Modify all EXISTING user profiles
-        $UserSIDs = @{}
-        try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.Name] = $_.SID } } catch {}
+        # --- Part 2: Modify all EXISTING user profiles ---
+        # This logic is already correct and does not need to change.
+        $UserSIDs = @{}; try { Get-CimInstance Win32_UserAccount | ForEach-Object { $UserSIDs[$_.Name] = $_.SID } } catch {}
         Get-ChildItem -Path "$env:SystemDrive\Users" -Directory | ForEach-Object {
-            $UserProfile = $_
-            $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
+            $UserProfile = $_; $NTUserDataFile = "$($UserProfile.FullName)\NTUSER.DAT"
             if ($UserProfile.Name -in @("Default", "Public", "Default User") -or (-not (Test-Path $NTUserDataFile))) { return }
             $UserSID = $UserSIDs[$UserProfile.Name]; if (-not $UserSID) { return }
 
             if (Test-Path "Registry::HKEY_USERS\$UserSID") {
-                # User is logged in
                 try {
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', "[HKEY_USERS\$UserSID"
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
-                    Write-Host "  Applying settings to logged-in user: $($UserProfile.Name)" -ForegroundColor DarkGray
                 } catch {}
             } else {
-                # User is logged off
                 try {
                     reg load "HKU\TempUserHive" $NTUserDataFile | Out-Null
                     $TempRegContent = $RegContent -replace '\[HKEY_CURRENT_USER', '[HKEY_USERS\TempUserHive'
                     Set-Content -Path $TempRegFile -Value $TempRegContent -Encoding Ascii -Force
                     reg import $TempRegFile | Out-Null
-                    Write-Host "  Applying settings to logged-off user profile: $($UserProfile.Name)" -ForegroundColor DarkGray
-                } catch {
-                } finally { reg unload "HKU\TempUserHive" | Out-Null }
+                } catch {} finally { if (Test-Path "HKU:\TempUserHive") { reg unload "HKU\TempUserHive" | Out-Null } }
             }
         }
         Remove-Item -Path $TempRegFile -Force -ErrorAction SilentlyContinue
     }
     Write-Output ""
 }
+
+# =================================================================================================
 # Restart the Windows Explorer process
+# =================================================================================================
+
 function RestartExplorer {
     Write-Output "> Restarting Windows Explorer process to apply all changes... (This may cause some flickering)"
 
@@ -568,9 +582,11 @@ function RestartExplorer {
     }
 }
 
-
+# =================================================================================================
 # Replace the startmenu for all users, when using the default startmenuTemplate this clears all pinned apps
 # Credit: https://lazyadmin.nl/win-11/customize-windows-11-start-menu-layout/
+# =================================================================================================
+
 function ReplaceStartMenuForAllUsers {
     param (
         $startMenuTemplate = "$PSScriptRoot/Start/start2.bin"
@@ -609,9 +625,11 @@ function ReplaceStartMenuForAllUsers {
     Write-Output ""
 }
 
-
+# =================================================================================================
 # Replace the startmenu for all users, when using the default startmenuTemplate this clears all pinned apps
 # Credit: https://lazyadmin.nl/win-11/customize-windows-11-start-menu-layout/
+# =================================================================================================
+
 function ReplaceStartMenu {
     param (
         $startMenuBinFile = "$env:LOCALAPPDATA\Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState\start2.bin",
@@ -937,57 +955,7 @@ if (Test-Path $UserDesktop) {
 Write-Host "--- Autostart Configuration Finished ---"
 
 
-# =================================================================================================
-# NEW FUNCTION - Applies all necessary UI settings to the Default Profile for NEW USERS
-# =================================================================================================
-function Set-DefaultUserSettings {
-    [CmdletBinding()]
-    param()
 
-    Write-Host "`n> Applying selected settings to the Default User profile for all future users..." -ForegroundColor Yellow
-
-    $DefaultUserPath = $env:SystemDrive + '\Users\Default\NTUSER.DAT'
-    if (-not (Test-Path $DefaultUserPath)) {
-        Write-Warning "  - Default User profile hive not found. Cannot apply settings for new users."
-        return
-    }
-
-    try {
-        Write-Host "  - Loading Default User hive..."
-        reg load "HKU\DefaultUserHive" $DefaultUserPath | Out-Null
-
-        # --- We check each parameter and apply the corresponding setting if it was used ---
-        
-        if ($global:Params.ContainsKey('HideSearchTb')) {
-            Write-Host "  - Hiding Taskbar Search for new users..."
-            $Key = "HKEY_USERS\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Search"
-            reg add $Key /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f | Out-Null
-        }
-        
-        if ($global:Params.ContainsKey('RevertContextMenu')) {
-            Write-Host "  - Reverting Context Menu for new users..."
-            $Key = "HKEY_USERS\DefaultUserHive\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32"
-            reg add $Key /ve /d "" /f | Out-Null
-        }
-
-        # Add any other HKCU tweaks for new users here following the same pattern.
-        # For example:
-        if ($global:Params.ContainsKey('TaskbarAlignLeft')) {
-            Write-Host "  - Aligning Taskbar to the left for new users..."
-            $Key = "HKEY_USERS\DefaultUserHive\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-            reg add $Key /v TaskbarAl /t REG_DWORD /d 0 /f | Out-Null
-        }
-
-    }
-    catch {
-        Write-Warning "  - An error occurred while modifying the Default User hive. Error: $($_.Exception.Message)"
-    }
-    finally {
-        # CRITICAL: Always unload the hive
-        Write-Host "  - Unloading Default User hive."
-        reg unload "HKU\DefaultUserHive" | Out-Null
-    }
-}
 
 ##################################################################################################################
 #                                                                                                                #
@@ -1971,7 +1939,7 @@ try {
     Write-Host "  - Default taskbar XML layout has been set for new users."
 } catch { Write-Warning "  - Could not set the default taskbar layout XML. Error: $($_.Exception.Message)" }
 
-    Set-DefaultUserSettings
+    
 	RestartExplorer
 
     Write-Output ""
